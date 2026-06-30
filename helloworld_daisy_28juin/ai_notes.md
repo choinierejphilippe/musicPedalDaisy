@@ -1,6 +1,6 @@
-# Project Architecture Summary: Rhodes Stereo Studio Processing Rig
+# Project Architecture Summary: Rhodes Stereo Studio Processing Rig (Part 1)
 
-This document contains the structural notes, engineering constraints, and mathematical design decisions finalized during our development session for the Electro-Smith Daisy Seed (programmed via the Arduino IDE using `DaisyDuino`).
+This document contains the finalized structural specs, hardware interface conventions, and diagnostic logs developed for the Electro-Smith Daisy Seed via the `DaisyDuino` core.
 
 ---
 
@@ -8,26 +8,32 @@ This document contains the structural notes, engineering constraints, and mathem
 
 The layout utilizes a dynamic menu-switching strategy to control **8 sequential audio effects blocks** using the two physical knobs, buttons, and RGB LEDs of the Electro-Smith Daisy Pod.
 
-*   **Button 1**: Cycles through the effects menu.
-*   **Button 2**: Toggles the currently selected effect **ON / OFF**.
-*   **Encoder Rotary**: Increments/decrements a **dedicated, effect-specific Dry/Wet mix parameter** (0.0f to 1.0f).
-*   **Dual Hold Reset**: Pressing both Button 1 and Button 2 simultaneously for **3 seconds** performs a global parameter wipe. It bypasses all effects and restores factory default baseline values, accompanied by a 300ms red confirmation LED flash.
+*   **Button 1 (`pod.buttons[0]`)**: Cycles through the effects menu (advances the current menu index).
+*   **Button 2 (`pod.buttons[1]`)**: Toggles the currently selected effect **ON / OFF**.
+*   **Encoder Rotary**: Increments/decrements a **dedicated, effect-specific Dry/Wet mix parameter** (`effect_mix[current_effect]`) from 0.0f to 1.0f.
+*   **Dual Hold Reset**: Pressing both physical buttons simultaneously for **3 seconds** performs a global parameter wipe. It bypasses all effects and restores factory default baseline values, accompanied by a 300ms red confirmation LED flash.
 
-### LED Color & Control Spec Cheat Sheet
+### Printable Interface & Control Spec Cheat Sheet
 
-| Effect Matrix | LED 1 Color | Knob 1 Role | Knob 2 Role | Default Mix |
-| :--- | :--- | :--- | :--- | :--- |
-| **1. BOOST** | 🟡 Yellow | Clean Boost Gain | Treble/Bark Tilt | 100% Wet (Series) |
-| **2. OVERDRIVE** | 🔴 Red | Drive Intensity | High-End Tone Filter | 100% Wet (Series) |
-| **3. WAH** | 🟠 Orange | Filter Freq | Resonance Peak | 50% Blended Split |
-| **4. SPRING_REVERB**| 🌸 Pink/Amber | Amp Spring Decay | Feedback Resonance | 30% Ambient Blend |
-| **5. PHASER** | 🟢 Green | Sweep Rate (LFO) | Resonant Feedback | 30% Ambient Blend |
-| **6. CHORUS** | 🔵 Cyan | Modulation Speed| Delay Width | 30% Ambient Blend |
-| **7. DELAY** | 🔵 Blue | Echo Time Length | Feedback Repeats | 30% Ambient Blend |
-| **8. PLATE_REVERB** | 🟣 Magenta | Plate Size/Decay | Diffusion Space | 30% Ambient Blend |
+```text
++---+───────────────+──────────────+────────────────────+──────────────────────────────+
 
-*   **LED 1 (Left)** displays the current menu slot configuration color.
-*   **LED 2 (Right)** displays **Solid Red** if the active effect is bypassed. If the effect is active, it shifts through a smooth **Blue ➔ Green (Cyan/Teal) gradient** representing the exact depth of the local encoder Dry/Wet mix.
+| # | EFFECT MODULE | LED 1 COLOR  | KNOB 1 ROLE        | KNOB 2 ROLE                  |
++---+───────────────+──────────────+────────────────────+──────────────────────────────+
+
+| 1 | BOOST         | 🟡 Yellow     | Clean Boost Gain   | Treble / Tine Bark Tilt      |
+| 2 | OVERDRIVE     | 🔴 Red        | Drive Intensity    | High-End Tone Filter         |
+| 3 | WAH           | 🟠 Orange     | Filter Frequency   | Resonance Peak Sharpness     |
+| 4 | SPRING_REVERB | 🌸 Pink/Amber | Amp Spring Decay   | Tank Feedback Resonance      |
+| 5 | PHASER        | 🟢 Green      | Sweep Rate (LFO)   | Resonant Notch Feedback      |
+| 6 | CHORUS        | 🔵 Cyan       | Modulation Speed   | Delay Modulation Width       |
+| 7 | DELAY         | 🔵 Blue       | Echo Time Length   | Feedback Repeat Tails        |
+| 8 | PLATE_REVERB  | 🟣 Magenta    | Plate Room Size    | High Diffusion Space         |
++---+───────────────+──────────────+────────────────────+──────────────────────────────+
+```
+
+*   **LED 1 (`pod.leds[0]`)** displays the current menu slot configuration color (shown above).
+*   **LED 2 (`pod.leds[1]`)** displays **Solid Red** if the active effect is bypassed. If the effect is active, it shifts through a smooth **Blue ➔ Green (Cyan/Teal) gradient** representing the exact depth of the local encoder Dry/Wet mix (`0.0f` = Pure Blue, `0.5f` = Teal, `1.0f` = Pure Green).
 
 ---
 
@@ -35,16 +41,28 @@ The layout utilizes a dynamic menu-switching strategy to control **8 sequential 
 
 When extending this code, future models **must** adhere strictly to the following `DaisyDuino` syntax properties discovered during compilation optimization:
 
-*   **LED Addressing**: The Pod class library defines the LEDs as a classic indexed array size pointer: `pod.leds[0].Set(r,g,b)` (LED 1) and `pod.leds[1].Set(r,g,b)` (LED 2). Named properties like `pod.led1` or standalone class definitions break compilation.
-*   **Button Arrays**: Hardware button tracking mirrors the LED logic: `pod.buttons[0]` and `pod.buttons[1]`.
+*   **LED & Button Arrays**: The Pod hardware class library defines symbols as classic arrays. Access requires exact index brackets: `pod.buttons[0]`, `pod.buttons[1]`, `pod.leds[0]`, and `pod.leds[1]`. Calling dot methods directly (like `pod.led1` or `pod.leds.Set()`) breaks compilation.
 *   **Analog Polling**: Potentiometer data registers require calling `pod.ProcessAnalogControls();` at the very beginning of the background UI loop before calling standard `analogRead()` mappings.
-*   **Stereo Buffer Memory Management**: Long delay windows demand substantial RAM. Storing large arrays internally causes core crashes. Reverb plate structures and the main echo lines utilize the board's massive 64MB external memory block by prefixing variables with the macro **`DSY_SDRAM_BSS`**. Short modulation buffers (like Chorus) remain on the fast internal chip to prevent data bus bottleneck clicks.
-*   **Stereo Matrix Layout**: Audio signals are parsed as explicit pointer-to-pointer 2D channels: `in[0][i]` (Left input sample), `in[1][i]` (Right input sample), `out[0][i]` (Left output), and `out[1][i]` (Right output). Flat array indices like `in[i]` cause type-casting compiler drops.
-*   **Potentiometer Catch-Up Logic**: To prevent massive parameter jumps when switching menus, "value hooking" locks variable adjustment. The parameter won't change until the physical pot physically sweeps past or matches (`abs() < 0.02f`) the virtual stored baseline location.
+*   **Stereo Buffer Memory Management**: Long delay windows demand substantial RAM. Reverb plate structures and the main echo lines utilize the board's massive 64MB external memory block by prefixing variables with the macro **`DSY_SDRAM_BSS`**. Short modulation buffers (like Chorus) remain on the fast internal chip to prevent data bus bottleneck clicks.
+*   **Stereo Matrix Layout**: Audio signals inside the callback are parsed as explicit pointer-to-pointer 2D channels. You must index them explicitly as `in[0][i]` (Left input sample), `in[1][i]` (Right input sample), `out[0][i]` (Left output), and `out[1][i]` (Right output).
+*   **Instant Hook Latch Activation**: To prevent parameters from sleeping behind the potentiometer "catch-up" safety check when an effect is engaged, the script forces `knob1_hooked = true` and `knob2_hooked = true` the exact millisecond Button 2 activates a slot.
 
 ---
 
-## 3. 🎹 Rhodes-Specific FX Chain & DSP Mathematical Modeling
+## 3. 🔍 Diagnostics: What We Tried vs. What Failed (Preset Storage Layer)
+
+*   **Attempt 1 (Global Scoping `PersistentStorage<PresetData> flash_storage(qspi);`)**: Failed with `error: 'qspi' was not declared in this scope`. DaisyDuino completely hides low-level hardware identifiers from global file scope.
+*   **Attempt 2 (Arduino Macros `DAISY.SavePreset`)**: Failed with `error: 'class AudioClass' has no member named 'SavePreset'`. The simple Arduino `DAISY` wrapper is built strictly for audio streaming and codec initialization; it excludes flash memory helpers.
+*   **Attempt 3 (Hardware Pointers `pod.seed.qspi`)**: Failed with `error: 'class DaisyHardware' has no member named 'seed'`. `DaisyHardware` encapsulates the physical main board as a sealed class object, locking out direct access to low-level QSPI drivers.
+*   **Final Decision**: Cancelled preset storage tracking until internal namespace wrapper changes can be manually applied to the local `DaisyDuino.h` core architecture files.
+
+# Project Architecture Summary: Rhodes Stereo Studio Processing Rig (Part 2)
+
+This document maps out the Post-Processing Studio Console Architecture routing layout and provides the definitive core code blocks for the system loops.
+
+---
+
+## 1. 🎹 Rhodes-Specific FX Chain & DSP Routing Philosophy
 
 The architecture was intentionally designed for a Rhodes piano outputting a **true stereo panning field** from an onboard preamp (such as an Avion Studios RetroFlyer).
 
@@ -90,42 +108,150 @@ The architecture was intentionally designed for a Rhodes piano outputting a **tr
               ▼
    ┌──────────────────────┐
    │  8. Plate Reverb     │ ───► 4-Stage Lattice All-Pass Diffuser (Console Space)
-   └──────────────────────┘
+   └──────────────────────┐
               │
               ▼
    [Stereo Speaker Output]
 ```
 
-### Why This Routing Was Chosen (Studio Recording Rig Design)
 Unlike a traditional guitar pedalboard where all pedals feed into the front of a mono amplifier, this rig follows a **Post-Processing Studio Console Architecture**. 
-Drive, Wah, and Spring Reverb form the "amplifier stage," while the Phaser, Chorus, Delay, and Plate Reverb process the sound *after* the amp. This prevents the panning stereo image generated by the Rhodes from being squashed, allowing the time-based echoes and modulation sweeps to spread out into a wide, 3D stereo field.
-
-### Mathematical Inner-Workings of the Effects
-1.  **ProcessBoost (Pre-Gain Driver)**: Uses a variable input gain multiplier to push the overdrive stage. Includes a high-pass shelving filter on Knob 2 to dial in a treble/bark tilt, cleaning up low-end mud before saturation.
-2.  **ProcessOverdrive (Dynamic Saturation)**: Replaces harsh digital clipping with a hyperbolic tangent function (`tanhf(boosted)`). This provides an analog-style curve that keeps soft playing clean, but smoothly saturates into warm 3rd-harmonic warmth when keys are struck aggressively.
-3.  **ProcessWah (State-Variable Topology)**: Implements an active State-Variable Filter (SVF) that remains completely stable during rapid sweeps. It mixes **70% Band-pass** (vocal character) with **30% Low-pass** (bass fundamental) to ensure thick chords maintain their body.
-4.  **ProcessSpringReverb (Physical Amp Tank)**: Emulates a physical spring pan using short, uneven delay lengths tuned to precise prime numbers (`841`, `1063`, `1373`). This generates a fluttery, vintage "chirp" artifact on note attacks, capturing the vibe of a mic'd Fender Twin amplifier.
-5.  **ProcessPhaser (4-Stage Cascade)**: Emulates an MXR Phase 90 circuit using a cascade of 4 all-pass filter stages. Driven by a triangle-wave LFO, it spends equal time in each frequency band for a smooth, uniform, analog-feeling rhythm.
-6.  **ProcessChorus (Stereo Ensemble Width)**: Uses a modulated delay line driven by a smooth sine-wave LFO to mimic analog bucket-brigade device (BBD) chips. A **90-degree phase offset** (`0.25f`) is applied between the Left and Right channels, lowering the pitch on one side while raising it on the other for an immersive stereo spread.
-7.  **ProcessDelay (Headroom-Protected Echo)**: A circular echo buffer that maps parameter lengths from 20ms to 1s. To solve harsh digital clipping when echoes stack, feedback is capped safely at `0.75f` and mixed via a balanced headroom scale factor.
-8.  **ProcessPlateReverb (Studio Diffusion)**: Routes the entire signal through a 4-stage lattice all-pass diffuser network. It scatters the notes into a dense, smooth, metallic sheen, simulating a suspended steel plate that glues the tracks together.
+Drive, Wah, and Spring Reverb form the "amplifier stage," while the Phaser, Chorus, Delay, and Plate Reverb process the sound *after* the amp. This prevents the panning stereo image generated by the Rhodes preamp from being collapsed to mono, allowing the time-based echoes and modulation sweeps to spread out into a wide, 3D stereo field.
 
 ---
 
-## 4. 🔍 Diagnostics: What We Tried vs. What Failed (Preset Storage Layer)
+## 2. 🛠️ Finalized Reference Implementations (Core UI & DSP Wrapper Loops)
 
-The following analysis documents the troubleshooting sequence encountered when attempting to link libDaisy's low-level Flash QSPI lines through the high-level `DaisyDuino` layer. Refer to this section when attempting to implement preset saving again in a future session.
+### Core UI Control Loop (`UpdateControls`)
+```cpp
+void UpdateControls() {
+    pod.ProcessAnalogControls(); 
+    pod.DebounceControls();
 
-### Attempt 1: Native libDaisy Global Scoping
-*   **The Approach**: Attempted to instantiate the global flash memory block before the main runtime using standard library tokens: `PersistentStorage<PresetData> flash_storage(qspi);` or `flash_storage(qspi_handle);`.
-*   **The Compilation Log Failures**: 
-    `error: 'qspi' was not declared in this scope`
-    `error: 'qspi_handle' was not declared in this scope`
-*   **The Cause**: The `DaisyDuino` Arduino core completely hides libDaisy's low-level hardware identifiers from global file scope. They do not exist as loose identifiers before `setup()` runs.
+    if (pod.buttons[0].Pressed() && pod.buttons[1].Pressed()) {
+        if (!dual_hold_active) {
+            dual_hold_active = true; buttons_held_start_time = millis();
+        }
+        if (millis() - buttons_held_start_time >= 3000) {
+            for (int i = 0; i < NUM_EFFECTS; i++) effect_active[i] = false;
+            effect_param1[BOOST] = 0.4f;  effect_param2[BOOST] = 0.5f;
+            effect_param1[OVERDRIVE] = 0.3f;  effect_param2[OVERDRIVE] = 0.4f;
+            effect_param1[WAH] = 0.4f;  effect_param2[WAH] = 0.3f;
+            effect_param1[SPRING_REVERB] = 0.3f;  effect_param2[SPRING_REVERB] = 0.3f;
+            effect_param1[PHASER] = 0.2f;  effect_param2[PHASER] = 0.5f;
+            effect_param1[CHORUS] = 0.3f;  effect_param2[CHORUS] = 0.4f;
+            effect_param1[DELAY] = 0.35f; effect_param2[DELAY] = 0.4f;
+            effect_param1[PLATE_REVERB] = 0.4f;  effect_param2[PLATE_REVERB] = 0.4f;
+            effect_mix[BOOST] = 1.0f;  effect_mix[OVERDRIVE] = 1.0f;  effect_mix[WAH] = 0.5f;
+            effect_mix[SPRING_REVERB] = 0.3f;  effect_mix[PHASER] = 0.3f;  effect_mix[CHORUS] = 0.3f;
+            effect_mix[DELAY] = 0.3f;  effect_mix[PLATE_REVERB] = 0.3f;
+            current_effect = BOOST; knob1_hooked = false; knob2_hooked = false;
+            is_flashing_reset = true; reset_flash_timer = millis(); dual_hold_active = false;
+        }
+    } else { dual_hold_active = false; }
 
-### Attempt 2: Arduino Wrapper Macros (`DAISY.SavePreset`)
-*   **The Approach**: Abandoned `PersistentStorage` and attempted to leverage direct, higher-level helper wrappers: `DAISY.SavePreset(&local_data, sizeof(PresetData));`.
-*   **The Compilation Log Failures**:
-    `error: 'class AudioClass' has no member named 'SavePreset'`
-    `error: 'class AudioClass' has no member named 'LoadPreset'`
-The Cause: The AudioClass instance (DAISY) inside DaisyDuino is built strictly for audio streaming and codec initialization. Unlike other basic Arduino audio wrappers, it does not include flash memory helper methods.Attempt 3: Hardware Object Navigation (pod.seed.qspi)The Approach: Attempted to drill down through our initialized DaisyHardware object (pod) to grab its inner microcontroller lanes using a dynamic pointer: flash_storage = new PersistentStorage<PresetData>(pod.seed.qspi); inside setup().The Compilation Log Failures:error: 'class DaisyHardware' has no member named 'seed'error: 'class DaisyHardware' has no member named 'Control'The Cause: DaisyHardware is an opaque container class. It completely seals off its internal objects. Members like .seed, .pod, or .Control() are strictly hidden from the public API to keep the Arduino implementation simple.Attempt 4: Direct Singleton ResolutionThe Approach: Attempted to query the internal static driver interface inside the underlying library: *(daisy::QSPIHandle::Get()).The Compilation Log Failures:error: 'GetDriver' / 'Get' is not a member of 'daisy::PersistentStorage<PresetData>'The Cause: While the underlying C++ library (libDaisy) contains these definitions, the DaisyDuino Arduino port strips them out or renames them to limit the memory footprint of the IDE sketches.💡 The Solution path for the next sessionTo successfully implement preset saving in a future session without hitting these compilation errors, you must use explicit conditional compiler headers or a custom local file modification.Inside DaisyDuino.h, look at how DaisyHardware initializes the board. If the board is targeted as a Pod, find the internal variable tracking the board name. It is typically a private instance of a DaisyPod class. You can edit DaisyDuino.h to move that variable from private: to public:, which will instantly grant you access to pod.hw.qspi (or similar) inside your main sketch.
+    if (is_flashing_reset) {
+        if (millis() - reset_flash_timer < 300) {
+            pod.leds[0].Set(0.5f, 0.0f, 0.0f); pod.leds[1].Set(0.5f, 0.0f, 0.0f); return;
+        } else { is_flashing_reset = false; }
+    }
+
+    if (!dual_hold_active) {
+        if (pod.buttons[0].RisingEdge()) {
+            current_effect++; if (current_effect >= NUM_EFFECTS) current_effect = BOOST;
+            knob1_hooked = false; knob2_hooked = false;
+        }
+        if (pod.buttons[1].RisingEdge()) {
+            effect_active[current_effect] = !effect_active[current_effect];
+            if (effect_active[current_effect]) {
+                knob1_hooked = true; knob2_hooked = true;
+            }
+        }
+    }
+
+    int32_t enc_move = pod.encoder.Increment();
+    if (enc_move != 0) {
+        effect_mix[current_effect] += (enc_move * 0.05f); 
+        effect_mix[current_effect] = constrain(effect_mix[current_effect], 0.0f, 1.0f);
+    }
+
+    float cur_k1 = analogRead(PIN_POD_POT_1) / 1023.0f;
+    float cur_k2 = analogRead(PIN_POD_POT_2) / 1023.0f;
+    float s_p1 = effect_param1[current_effect]; float s_p2 = effect_param2[current_effect];
+
+    if (!knob1_hooked) {
+        if ((last_knob1_phys <= s_p1 && cur_k1 >= s_p1) || (last_knob1_phys >= s_p1 && cur_k1 <= s_p1) || abs(cur_k1 - s_p1) < 0.02f) knob1_hooked = true;
+    }
+    if (knob1_hooked) effect_param1[current_effect] = cur_k1;
+
+    if (!knob2_hooked) {
+        if ((last_knob2_phys <= s_p2 && cur_k2 >= s_p2) || (last_knob2_phys >= s_p2 && cur_k2 <= s_p2) || abs(cur_k2 - s_p2) < 0.02f) knob2_hooked = true;
+    }
+    if (knob2_hooked) effect_param2[current_effect] = cur_k2;
+
+    last_knob1_phys = cur_k1; last_knob2_phys = cur_k2;
+
+    float b = 0.3f; 
+    switch (current_effect) {
+        case BOOST:         pod.leds[0].Set(b, b, 0.0f); break; 
+        case OVERDRIVE:     pod.leds[0].Set(b, 0.0f, 0.0f); break; 
+        case WAH:           pod.leds[0].Set(b, b * 0.5f, 0.0f); break;
+        case SPRING_REVERB: pod.leds[0].Set(b, b * 0.2f, b * 0.4f); break;
+        case PHASER:        pod.leds[0].Set(0.0f, b, 0.0f); break; 
+        case CHORUS:        pod.leds[0].Set(0.0f, b, b); break; 
+        case DELAY:         pod.leds[0].Set(0.0f, 0.0f, b); break; 
+        case PLATE_REVERB:  pod.leds[0].Set(b, 0.0f, b); break; 
+    }
+
+    if (!effect_active[current_effect]) {
+        pod.leds[1].Set(b, 0.0f, 0.0f); 
+    } else {
+        float cur_mix = effect_mix[current_effect];
+        pod.leds[1].Set(0.0f, cur_mix * b, (1.0f - cur_mix) * b); 
+    }
+}
+```
+
+### Main Audio Stream Dispatcher (`AudioCallback`)
+```cpp
+void AudioCallback(float **in, float **out, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        float left = in[0][i]; 
+        float right = in[1][i];
+
+        float mix_boost  = effect_active[BOOST]   ? effect_mix[BOOST]   : 0.0f;
+        float mix_drive  = effect_active[OVERDRIVE]? effect_mix[OVERDRIVE] : 0.0f;
+        float mix_wah    = effect_active[WAH]     ? effect_mix[WAH]     : 0.0f;
+        float mix_spring = effect_active[SPRING_REVERB]? effect_mix[SPRING_REVERB] : 0.0f;
+        float mix_phaser = effect_active[PHASER]  ? effect_mix[PHASER]  : 0.0f;
+        float mix_chorus = effect_active[CHORUS]  ? effect_mix[CHORUS]  : 0.0f;
+        float mix_delay  = effect_active[DELAY]   ? effect_mix[DELAY]   : 0.0f;
+        float mix_plate  = effect_active[PLATE_REVERB]? effect_mix[PLATE_REVERB] : 0.0f;
+
+        // --- LEFT RIG INS-CHANNEL FLOW ---
+        left = ProcessBoost(left, 0, effect_param1[BOOST], effect_param2[BOOST], mix_boost);
+        left = ProcessOverdrive(left, 0, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE], mix_drive);
+        left = ProcessWah(left, 0, effect_param1[WAH], effect_param2[WAH], mix_wah);
+        left = ProcessSpringReverb(left, 0, effect_param1[SPRING_REVERB], mix_spring);
+        left = ProcessPhaser(left, 0, effect_param1[PHASER], effect_param2[PHASER], mix_phaser);
+        left = ProcessChorus(left, 0, effect_param1[CHORUS], effect_param2[CHORUS], mix_chorus);
+        left = ProcessDelay(left, delay_buffer_l, mix_delay);
+        left = ProcessPlateReverb(left, 0, effect_param1[PLATE_REVERB], mix_plate);
+
+        // --- RIGHT RIG INS-CHANNEL FLOW ---
+        right = ProcessBoost(right, 1, effect_param1[BOOST], effect_param2[BOOST], mix_boost);
+        right = ProcessOverdrive(right, 1, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE], mix_drive);
+        right = ProcessWah(right, 1, effect_param1[WAH], effect_param2[WAH], mix_wah);
+        right = ProcessSpringReverb(right, 1, effect_param1[SPRING_REVERB], mix_spring);
+        right = ProcessPhaser(right, 1, effect_param1[PHASER], effect_param2[PHASER], mix_phaser);
+        right = ProcessChorus(right, 1, effect_param1[CHORUS], effect_param2[CHORUS], mix_chorus);
+        right = ProcessDelay(right, delay_buffer_r, mix_delay);
+        right = ProcessPlateReverb(right, 1, effect_param1[PLATE_REVERB], mix_plate);
+
+        write_ptr++; if (write_ptr >= MAX_DELAY_SAMPLES) write_ptr = 0;
+        chorus_write_ptr++; if (chorus_write_ptr >= CHORUS_BUFFER_SIZE) chorus_write_ptr = 0;
+
+        out[0][i] = left * global_vol; 
+        out[1][i] = right * global_vol;
+    }
+}
+```

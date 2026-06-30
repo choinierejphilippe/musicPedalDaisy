@@ -112,30 +112,27 @@ float ApplyDryWet(float dry, float wet, float mix) {
     return (dry * (1.0f - mix)) + (wet * mix);
 }
 
-float ProcessBoost(float input, int ch, float g, float t) {
-    if (!effect_active[BOOST]) return input;
+float ProcessBoost(float input, int ch, float g, float t, float live_mix) {
     float gain = 1.0f + (g * 3.0f); 
     float boosted = input * gain;
     static float hp_state[2] = {0.0f, 0.0f};
     hp_state[ch] += 0.15f * (boosted - hp_state[ch]);
     float highs = boosted - hp_state[ch];
     float wet = boosted + (highs * t * 1.5f);
-    return ApplyDryWet(input, wet * 0.75f, effect_mix[BOOST]);
+    return ApplyDryWet(input, wet * 0.75f, live_mix);
 }
 
-float ProcessOverdrive(float input, int ch, float drive, float tone) {
-    if (!effect_active[OVERDRIVE]) return input;
+float ProcessOverdrive(float input, int ch, float drive, float tone, float live_mix) {
     float gain = 1.0f + (drive * 14.0f);
     float wet = tanhf(input * gain);
     static float lp_state[2] = {0.0f, 0.0f};
     float cutoff = 0.05f + (tone * 0.95f); 
     lp_state[ch] += cutoff * (wet - lp_state[ch]);
     float makeup_gain = 1.0f / sqrtf(gain);
-    return ApplyDryWet(input, lp_state[ch] * makeup_gain, effect_mix[OVERDRIVE]);
+    return ApplyDryWet(input, lp_state[ch] * makeup_gain, live_mix);
 }
 
-float ProcessWah(float input, int ch, float freq, float res) {
-    if (!effect_active[WAH]) return input;
+float ProcessWah(float input, int ch, float freq, float res, float live_mix) {
     static float d1[2] = {0.0f, 0.0f};
     static float d2[2] = {0.0f, 0.0f};
     float target_freq = 200.0f + (freq * 2000.0f);
@@ -149,11 +146,10 @@ float ProcessWah(float input, int ch, float freq, float res) {
     d1[ch] = bp; d2[ch] = lp;
     float wet = (bp * 0.7f) + (lp * 0.3f);
     float attenuation = 1.0f - (res * 0.25f);
-    return ApplyDryWet(input, wet * attenuation, effect_mix[WAH]);
+    return ApplyDryWet(input, wet * attenuation, live_mix);
 }
 
-float ProcessSpringReverb(float input, int ch, float size, float mix_ctrl) {
-    if (!effect_active[SPRING_REVERB]) return input;
+float ProcessSpringReverb(float input, int ch, float size, float live_mix) {
     int s_sizes[NUM_SPRING_LINES] = {SPRING_LINE_0_SIZE, SPRING_LINE_1_SIZE, SPRING_LINE_2_SIZE};
     float decay = 0.45f + (size * 0.35f);
     float s_input = input; float wet_accum = 0.0f;
@@ -171,11 +167,10 @@ float ProcessSpringReverb(float input, int ch, float size, float mix_ctrl) {
         }
         wet_accum += ap_out; s_input = ap_out * 0.5f;
     }
-    return ApplyDryWet(input, wet_accum / 3.0f, effect_mix[SPRING_REVERB]);
+    return ApplyDryWet(input, wet_accum / 3.0f, live_mix);
 }
 
-float ProcessPhaser(float input, int ch, float rate, float feedback) {
-    if (!effect_active[PHASER]) return input;
+float ProcessPhaser(float input, int ch, float rate, float feedback, float live_mix) {
     static float ap_state[2][4] = {{0,0,0,0}, {0,0,0,0}};
     static float last_output[2] = {0.0f, 0.0f};
     if (ch == 0) {
@@ -193,11 +188,10 @@ float ProcessPhaser(float input, int ch, float rate, float feedback) {
         current = ap_out;
     }
     last_output[ch] = current;
-    return ApplyDryWet(input, current, effect_mix[PHASER]);
+    return ApplyDryWet(input, current, live_mix);
 }
 
-float ProcessChorus(float input, int ch, float rate, float depth) {
-    if (!effect_active[CHORUS]) return input;
+float ProcessChorus(float input, int ch, float rate, float depth, float live_mix) {
     float* buffer = (ch == 0) ? chorus_buffer_l : chorus_buffer_r;
     if (ch == 0) {
         chorus_lfo_phase += (0.00001f + (rate * 0.0012f));
@@ -213,22 +207,20 @@ float ProcessChorus(float input, int ch, float rate, float depth) {
     int idx_b = (idx_a + 1) >= CHORUS_BUFFER_SIZE ? 0 : idx_a + 1;
     float wet = buffer[idx_a] + (r_index - (float)idx_a) * (buffer[idx_b] - buffer[idx_a]);
     buffer[chorus_write_ptr] = input;
-    return ApplyDryWet(input, wet, effect_mix[CHORUS]);
+    return ApplyDryWet(input, wet, live_mix);
 }
 
-float ProcessDelay(float input, float *buffer) {
-    if (!effect_active[DELAY]) return input;
+float ProcessDelay(float input, float *buffer, float live_mix) {
     int d_samples = 1000 + (int)(effect_param1[DELAY] * (MAX_DELAY_SAMPLES - 1001));
     float feedback = effect_param2[DELAY] * 0.75f;
     int r_ptr = write_ptr - d_samples;
     if (r_ptr < 0) r_ptr += MAX_DELAY_SAMPLES;
     float delayed = buffer[r_ptr];
     buffer[write_ptr] = input + (delayed * feedback);
-    return ApplyDryWet(input, delayed, effect_mix[DELAY]);
+    return ApplyDryWet(input, delayed, live_mix);
 }
 
-float ProcessPlateReverb(float input, int ch, float size, float mix_ctrl) {
-    if (!effect_active[PLATE_REVERB]) return input;
+float ProcessPlateReverb(float input, int ch, float size, float live_mix) {
     float decay = 0.35f + (size * 0.55f);
     float current = input; float accumulator = 0.0f;
     for (int stage = 0; stage < NUM_PLATE_STAGES; stage++) {
@@ -245,33 +237,66 @@ float ProcessPlateReverb(float input, int ch, float size, float mix_ctrl) {
         }
         accumulator += ap_out; current = ap_out;
     }
-    return ApplyDryWet(input, accumulator / 4.0f, effect_mix[PLATE_REVERB]);
+    return ApplyDryWet(input, accumulator / 4.0f, live_mix);
 }
-
 void AudioCallback(float **in, float **out, size_t size) {
     for (size_t i = 0; i < size; i++) {
-        float left = in[0][i]; float right = in[1][i];
-        left = ProcessBoost(left, 0, effect_param1[BOOST], effect_param2[BOOST]);
-        left = ProcessOverdrive(left, 0, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE]);
-        left = ProcessWah(left, 0, effect_param1[WAH], effect_param2[WAH]);
-        left = ProcessSpringReverb(left, 0, effect_param1[SPRING_REVERB], effect_param2[SPRING_REVERB]);
-        left = ProcessPhaser(left, 0, effect_param1[PHASER], effect_param2[PHASER]);
-        left = ProcessChorus(left, 0, effect_param1[CHORUS], effect_param2[CHORUS]);
-        left = ProcessDelay(left, delay_buffer_l);
-        left = ProcessPlateReverb(left, 0, effect_param1[PLATE_REVERB], effect_param2[PLATE_REVERB]);
-        right = ProcessBoost(right, 1, effect_param1[BOOST], effect_param2[BOOST]);
-        right = ProcessOverdrive(right, 1, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE]);
-        right = ProcessWah(right, 1, effect_param1[WAH], effect_param2[WAH]);
-        right = ProcessSpringReverb(right, 1, effect_param1[SPRING_REVERB], effect_param2[SPRING_REVERB]);
-        right = ProcessPhaser(right, 1, effect_param1[PHASER], effect_param2[PHASER]);
-        right = ProcessChorus(right, 1, effect_param1[CHORUS], effect_param2[CHORUS]);
-        right = ProcessDelay(right, delay_buffer_r);
-        right = ProcessPlateReverb(right, 1, effect_param1[PLATE_REVERB], effect_param2[PLATE_REVERB]);
-        write_ptr++; if (write_ptr >= MAX_DELAY_SAMPLES) write_ptr = 0;
-        chorus_write_ptr++; if (chorus_write_ptr >= CHORUS_BUFFER_SIZE) chorus_write_ptr = 0;
-        out[0][i] = left * global_vol; out[1][i] = right * global_vol;
+        // FIX: Extract individual channel samples explicitly [channel][sample_index]
+        float left = in[0][i]; 
+        float right = in[1][i];
+
+        float mix_boost  = effect_active[BOOST]   ? effect_mix[BOOST]   : 0.0f;
+        float mix_drive  = effect_active[OVERDRIVE]? effect_mix[OVERDRIVE] : 0.0f;
+        float mix_wah    = effect_active[WAH]     ? effect_mix[WAH]     : 0.0f;
+        float mix_spring = effect_active[SPRING_REVERB]? effect_mix[SPRING_REVERB] : 0.0f;
+        float mix_phaser = effect_active[PHASER]  ? effect_mix[PHASER]  : 0.0f;
+        float mix_chorus = effect_active[CHORUS]  ? effect_mix[CHORUS]  : 0.0f;
+        float mix_delay  = effect_active[DELAY]   ? effect_mix[DELAY]   : 0.0f;
+        float mix_plate  = effect_active[PLATE_REVERB]? effect_mix[PLATE_REVERB] : 0.0f;
+
+        // --- LEFT RIG INS-CHANNEL FLOW ---
+        left = ProcessBoost(left, 0, effect_param1[BOOST], effect_param2[BOOST], mix_boost);
+        left = ProcessOverdrive(left, 0, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE], mix_drive);
+        left = ProcessWah(left, 0, effect_param1[WAH], effect_param2[WAH], mix_wah);
+        left = ProcessSpringReverb(left, 0, effect_param1[SPRING_REVERB], mix_spring);
+        left = ProcessPhaser(left, 0, effect_param1[PHASER], effect_param2[PHASER], mix_phaser);
+        left = ProcessChorus(left, 0, effect_param1[CHORUS], effect_param2[CHORUS], mix_chorus);
+        left = ProcessDelay(left, delay_buffer_l, mix_delay);
+        left = ProcessPlateReverb(left, 0, effect_param1[PLATE_REVERB], mix_plate);
+
+        // --- RIGHT RIG INS-CHANNEL FLOW ---
+        right = ProcessBoost(right, 1, effect_param1[BOOST], effect_param2[BOOST], mix_boost);
+        right = ProcessOverdrive(right, 1, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE], mix_drive);
+        right = ProcessWah(right, 1, effect_param1[WAH], effect_param2[WAH], mix_wah);
+        right = ProcessSpringReverb(right, 1, effect_param1[SPRING_REVERB], mix_spring);
+        right = ProcessPhaser(right, 1, effect_param1[PHASER], effect_param2[PHASER], mix_phaser);
+        right = ProcessChorus(right, 1, effect_param1[CHORUS], effect_param2[CHORUS], mix_chorus);
+        right = ProcessDelay(right, delay_buffer_r, mix_delay);
+        right = ProcessPlateReverb(right, 1, effect_param1[PLATE_REVERB], mix_plate);
+
+        write_ptr++; 
+        if (write_ptr >= MAX_DELAY_SAMPLES) write_ptr = 0;
+        chorus_write_ptr++; 
+        if (chorus_write_ptr >= CHORUS_BUFFER_SIZE) chorus_write_ptr = 0;
+
+        // FIX: Route scalar sample variables cleanly back out to 2D channel outputs
+        out[0][i] = left * global_vol; 
+        out[1][i] = right * global_vol;
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 void setup() {
     pod = DAISY.init(DAISY_POD, AUDIO_SR_48K);
@@ -294,7 +319,7 @@ void setup() {
 
 void UpdateControls() {
     pod.ProcessAnalogControls(); 
-    pod.DebounceControls();
+    pod.DebounceControls(); // FIX: This single method automatically updates the encoder under the hood.
 
     // 3-Second Dual Hold Master Reset
     if (pod.buttons[0].Pressed() && pod.buttons[1].Pressed()) {
@@ -330,9 +355,17 @@ void UpdateControls() {
             current_effect++; if (current_effect >= NUM_EFFECTS) current_effect = BOOST;
             knob1_hooked = false; knob2_hooked = false;
         }
-        if (pod.buttons[1].RisingEdge()) effect_active[current_effect] = !effect_active[current_effect];
+        if (pod.buttons[1].RisingEdge()) {
+            effect_active[current_effect] = !effect_active[current_effect];
+            if (effect_active[current_effect]) {
+                knob1_hooked = true; knob2_hooked = true;
+            }
+        }
     }
 
+    // FIX 2: Increased step size to 0.05f (5% per click). 
+    // Since an encoder notch returns a raw integer 1 or -1, this requires exactly 20 notch turns 
+    // to sweep your audio mix cleanly across the entire gamut without feeling sluggish or dropping ticks.
     int32_t enc_move = pod.encoder.Increment();
     if (enc_move != 0) {
         effect_mix[current_effect] += (enc_move * 0.05f); 
@@ -355,6 +388,7 @@ void UpdateControls() {
 
     last_knob1_phys = cur_k1; last_knob2_phys = cur_k2;
 
+    // LED 1 Menu Color Indicators
     float b = 0.3f; 
     switch (current_effect) {
         case BOOST:         pod.leds[0].Set(b, b, 0.0f); break; 
@@ -367,12 +401,28 @@ void UpdateControls() {
         case PLATE_REVERB:  pod.leds[0].Set(b, 0.0f, b); break; 
     }
 
+       // LED 2 Discrete 10-Step Visual Feedback
     if (!effect_active[current_effect]) {
-        pod.leds[1].Set(b, 0.0f, 0.0f); 
+        pod.leds[1].Set(b, 0.0f, 0.0f); // Solid Red ALWAYS means bypassed
     } else {
-        float cur_mix = effect_mix[current_effect];
-        pod.leds[1].Set(0.0f, cur_mix * b, (1.0f - cur_mix) * b); 
+        int step = (int)(effect_mix[current_effect] * 10.0f + 0.5f);
+        
+        switch(step) {
+            case 0:  pod.leds[1].Set(0.0f, 0.0f, b);     break; //   0% Mix: Pure Blue
+            case 1:  pod.leds[1].Set(0.0f, b * 0.2f, b); break; //  10% Mix: Deep Sapphire
+            case 2:  pod.leds[1].Set(0.0f, b * 0.4f, b); break; //  20% Mix: Ice Blue
+            case 3:  pod.leds[1].Set(0.0f, b * 0.6f, b); break; //  30% Mix: Light Cyan
+            case 4:  pod.leds[1].Set(0.0f, b * 0.8f, b); break; //  40% Mix: Electric Electric
+            case 5:  pod.leds[1].Set(0.0f, b, b);       break; //  50% Mix: Pure Cyan (Equal Green/Blue)
+            case 6:  pod.leds[1].Set(0.0f, b, b * 0.7f); break; //  60% Mix: Deep Teal
+            case 7:  pod.leds[1].Set(0.0f, b, b * 0.4f); break; //  70% Mix: Mint Green
+            case 8:  pod.leds[1].Set(b * 0.2f, b, 0.0f); break; //  80% Mix: Lime/Chartreuse
+            case 9:  pod.leds[1].Set(b * 0.5f, b, 0.0f); break; //  90% Mix: Yellow-Green
+            case 10: pod.leds[1].Set(0.0f, b, 0.0f);     break; // 100% Mix: Pure Green
+            default: pod.leds[1].Set(0.0f, 0.0f, b);     break;
+        }
     }
+
 }
 
 void loop() {
