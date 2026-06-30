@@ -4,6 +4,23 @@ This document contains the finalized structural specs, hardware interface conven
 
 ---
 
+-------------------- JP's notes -AI do not erase--------
+20260629 - great ! all effects are somewhat working. the main sequence is there. 
+- boost : love It
+-overdrive : max settings way too intense. half way is enough. 
+-wah : not intense enough ! would like more wah
+-spring : not audible a lot. would like more, maybe more duration.
+-phaser : would like settings to go higher. 
+-chorus : great sounding, especially when the tremolo from the retro flyer is on. wow. max settings way too intense, change the limits. 
+-delay : return of the clipping ; probably the wet-dry that needs to be adjusted before the summing up. couldn't really try. 
+-plate reverb : ok sound, but not long enough. maybe add some length ? Maybe add room reverb ? also, volume is lower, so more wet decreases volume. add gain on the wet. 
+- general notes : the encoder seems to be not working when we turn too fast.... like it misses pulses. to investigate. Also, it's clunky. 
+- LED color scheme for the different effects ; somewhat hard to differentiate ; instead of continuum of colors, do big jumps.
+---REALLY ENJOYABLE EXPERIENCE, OVERALL
+
+-------
+
+
 ## 1. 🎛️ Physical Hardware Map & User Interface (Daisy Pod Shield)
 
 The layout utilizes a dynamic menu-switching strategy to control **8 sequential audio effects blocks** using the two physical knobs, buttons, and RGB LEDs of the Electro-Smith Daisy Pod.
