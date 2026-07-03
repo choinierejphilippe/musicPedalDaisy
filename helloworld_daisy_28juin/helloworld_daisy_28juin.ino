@@ -75,8 +75,6 @@ unsigned long buttons_held_start_time = 0;
 bool dual_hold_active = false;
 unsigned long reset_flash_timer = 0;
 bool is_flashing_reset = false;
-bool last_button0_state = false;
-bool last_button1_state = false;
 
 #define MAX_DELAY_SAMPLES 48000
 float DSY_SDRAM_BSS delay_buffer_l[MAX_DELAY_SAMPLES];
@@ -88,7 +86,18 @@ float chorus_buffer_l[CHORUS_BUFFER_SIZE];
 float chorus_buffer_r[CHORUS_BUFFER_SIZE];
 int chorus_write_ptr = 0;
 float chorus_lfo_phase = 0.0f;
-float phaser_lfo_phase = 0.0f;
+
+// Daisy Oscillators for efficient LFO generation (replaces manual sinf)
+Oscillator phaser_lfo_osc;
+Oscillator wah_lfo_osc;
+
+// Cached parameters (computed only in UpdateControls, not every sample)
+// PHASER caches
+float phaser_rate_hz = 0.05f;      // Pre-computed from effect_param1[PHASER]
+float phaser_feedback_val = 0.0f;  // Pre-computed from effect_param2[PHASER]
+
+// WAH caches (for LFO mode)
+float wah_lfo_rate = 0.1f;         // Pre-computed from effect_param1[WAH] when in LFO zone
 
 #define NUM_SPRING_LINES 3
 #define SPRING_LINE_0_SIZE 841
@@ -233,19 +242,15 @@ float ProcessWah_SmartMacro(float input, int ch, float freq_knob, float res_knob
     static float d1[2] = {0.0f, 0.0f};
     static float d2[2] = {0.0f, 0.0f};
     static float env[2] = {0.0f, 0.0f};
-    static float lfo_phase = 0.0f;
 
     // --- 2. MACRO LOGIC (Bouton 1 divisé en 3 zones) ---
     float mod = 0.0f;
     
     if (freq_knob < 0.45f) {
-        // ZONE LFO (0% à 45%) : Contrôle de la vitesse
-        float lfo_rate = 0.1f + ((freq_knob / 0.45f) * 3.9f); // 0.1 à 4.0 Hz
-        if (ch == 0) {
-            lfo_phase += (2.0f * PI * lfo_rate) / 48000.0f;
-            if (lfo_phase >= 2.0f * PI) lfo_phase -= 2.0f * PI;
-        }
-        mod = (sinf(lfo_phase) * 0.5f) + 0.5f;
+        // ZONE LFO (0% à 45%) : Uses pre-computed wah_lfo_rate from UpdateControls
+        // Daisy oscillator handles the sinf() efficiently
+        float lfo_val = (wah_lfo_osc.Process() * 0.5f) + 0.5f;
+        mod = lfo_val;
     } 
     else if (freq_knob > 0.55f) {
         // ZONE ENVELOPE (55% à 100%) : Contrôle de la sensibilité
@@ -310,7 +315,7 @@ float ProcessSpringReverb(float input, int ch, float size, float live_mix) {
     return ApplyDryWet(input, wet_accum / 3.0f, live_mix);
 }
 
-float ProcessPhaser(float input, int ch, float rate, float feedback, float live_mix) {
+float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
     // Mémoires d'état stéréo [canal][étage]
     static float ap_state[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
     static float last_output[2] = {0.0f, 0.0f};
@@ -318,31 +323,17 @@ float ProcessPhaser(float input, int ch, float rate, float feedback, float live_
     // Constantes d'imperfection vintage (±4%)
     const float imperfections[4] = {0.97f, 1.04f, 0.99f, 1.02f};
 
-    // --- 1. RATE KNOB (Exponentiel) ---
-    // Plage: 0.05 Hz à 10.0 Hz (10.0 / 0.05 = 200.0)
-    float rate_hz = 0.05f * powf(200.0f, rate);
-
-    // Le LFO n'est mis à jour qu'une seule fois par cycle d'échantillon (canal gauche)
-    if (ch == 0) {
-        float phase_inc = (2.0f * PI * rate_hz) / 48000.0f;
-        phaser_lfo_phase += phase_inc;
-        if (phaser_lfo_phase >= 2.0f * PI) {
-            phaser_lfo_phase -= 2.0f * PI;
-        }
-    }
-
-    // LFO sinusoïdal normalisé entre 0.0f et 1.0f
-    float lfo_sine = (sinf(phaser_lfo_phase) * 0.5f) + 0.5f;
+    // OPTIMIZED: rate_hz and feedback_val are pre-computed in UpdateControls() and passed as arguments
+    // No global state - all parameters passed explicitly
+    
+    // LFO output from Daisy oscillator (efficient vs manual sinf)
+    float lfo_sine = (phaser_lfo_osc.Process() * 0.5f) + 0.5f;
 
     // --- 2. SWEEP RANGE (Logarithmique) ---
     // Plage: 150 Hz à 3000 Hz (3000 / 150 = 20.0)
     float f_target = 150.0f * powf(20.0f, lfo_sine);
 
-    // --- 3. FEEDBACK (Cubique bipolaire) ---
-    // Centre (0.5) = 0.0 | Min (0.0) = -1.0 | Max (1.0) = +1.0
-    float fb_val = 8.0f * powf(feedback - 0.5f, 3.0f);
-
-    float current = input + (last_output[ch] * fb_val);
+    float current = input + (last_output[ch] * feedback_val);
 
     // --- 4. LES 4 ÉTAGES ALL-PASS ---
     for (int stage = 0; stage < 4; stage++) {
@@ -428,34 +419,57 @@ void AudioCallback(float **in, float **out, size_t size) {
         // Envelope follower callback
         CurrentEnvelopeValue = global_env.Process(left, right);
 
-        float mix_boost  = effect_active[BOOST]   ? effect_mix[BOOST]   : 0.0f;
-        float mix_drive  = effect_active[OVERDRIVE]? effect_mix[OVERDRIVE] : 0.0f;
-        float mix_wah    = effect_active[WAH]     ? effect_mix[WAH]     : 0.0f;
-        float mix_spring = effect_active[SPRING_REVERB]? effect_mix[SPRING_REVERB] : 0.0f;
-        float mix_phaser = effect_active[PHASER]  ? effect_mix[PHASER]  : 0.0f;
-        float mix_chorus = effect_active[CHORUS]  ? effect_mix[CHORUS]  : 0.0f;
-        float mix_delay  = effect_active[DELAY]   ? effect_mix[DELAY]   : 0.0f;
-        float mix_plate  = effect_active[PLATE_REVERB]? effect_mix[PLATE_REVERB] : 0.0f;
+        // --- LEFT RIG INS-CHANNEL FLOW (only process active effects) ---
+        if (effect_active[BOOST]) {
+            left = ProcessBoost(left, 0, effect_param1[BOOST], effect_param2[BOOST], effect_mix[BOOST]);
+        }
+        if (effect_active[OVERDRIVE]) {
+            left = ProcessOverdrive(left, 0, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE], effect_mix[OVERDRIVE]);
+        }
+        if (effect_active[WAH]) {
+            left = ProcessWah(left, 0, effect_param1[WAH], effect_param2[WAH], effect_mix[WAH]);
+        }
+        if (effect_active[SPRING_REVERB]) {
+            left = ProcessSpringReverb(left, 0, effect_param1[SPRING_REVERB], effect_mix[SPRING_REVERB]);
+        }
+        if (effect_active[PHASER]) {
+            left = ProcessPhaser(left, 0, phaser_rate_hz, phaser_feedback_val, effect_mix[PHASER]);
+        }
+        if (effect_active[CHORUS]) {
+            left = ProcessChorus(left, 0, effect_param1[CHORUS], effect_param2[CHORUS], effect_mix[CHORUS]);
+        }
+        if (effect_active[DELAY]) {
+            left = ProcessDelay(left, delay_buffer_l, effect_mix[DELAY]);
+        }
+        if (effect_active[PLATE_REVERB]) {
+            left = ProcessPlateReverb(left, 0, effect_param1[PLATE_REVERB], effect_mix[PLATE_REVERB]);
+        }
 
-        // --- LEFT RIG INS-CHANNEL FLOW ---
-        left = ProcessBoost(left, 0, effect_param1[BOOST], effect_param2[BOOST], mix_boost);
-        left = ProcessOverdrive(left, 0, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE], mix_drive);
-        left = ProcessWah(left, 0, effect_param1[WAH], effect_param2[WAH], mix_wah);
-        left = ProcessSpringReverb(left, 0, effect_param1[SPRING_REVERB], mix_spring);
-        left = ProcessPhaser(left, 0, effect_param1[PHASER], effect_param2[PHASER], mix_phaser);
-        left = ProcessChorus(left, 0, effect_param1[CHORUS], effect_param2[CHORUS], mix_chorus);
-        left = ProcessDelay(left, delay_buffer_l, mix_delay);
-        left = ProcessPlateReverb(left, 0, effect_param1[PLATE_REVERB], mix_plate);
-
-        // --- RIGHT RIG INS-CHANNEL FLOW ---
-        right = ProcessBoost(right, 1, effect_param1[BOOST], effect_param2[BOOST], mix_boost);
-        right = ProcessOverdrive(right, 1, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE], mix_drive);
-        right = ProcessWah(right, 1, effect_param1[WAH], effect_param2[WAH], mix_wah);
-        right = ProcessSpringReverb(right, 1, effect_param1[SPRING_REVERB], mix_spring);
-        right = ProcessPhaser(right, 1, effect_param1[PHASER], effect_param2[PHASER], mix_phaser);
-        right = ProcessChorus(right, 1, effect_param1[CHORUS], effect_param2[CHORUS], mix_chorus);
-        right = ProcessDelay(right, delay_buffer_r, mix_delay);
-        right = ProcessPlateReverb(right, 1, effect_param1[PLATE_REVERB], mix_plate);
+        // --- RIGHT RIG INS-CHANNEL FLOW (only process active effects) ---
+        if (effect_active[BOOST]) {
+            right = ProcessBoost(right, 1, effect_param1[BOOST], effect_param2[BOOST], effect_mix[BOOST]);
+        }
+        if (effect_active[OVERDRIVE]) {
+            right = ProcessOverdrive(right, 1, effect_param1[OVERDRIVE], effect_param2[OVERDRIVE], effect_mix[OVERDRIVE]);
+        }
+        if (effect_active[WAH]) {
+            right = ProcessWah(right, 1, effect_param1[WAH], effect_param2[WAH], effect_mix[WAH]);
+        }
+        if (effect_active[SPRING_REVERB]) {
+            right = ProcessSpringReverb(right, 1, effect_param1[SPRING_REVERB], effect_mix[SPRING_REVERB]);
+        }
+        if (effect_active[PHASER]) {
+            right = ProcessPhaser(right, 1, phaser_rate_hz, phaser_feedback_val, effect_mix[PHASER]);
+        }
+        if (effect_active[CHORUS]) {
+            right = ProcessChorus(right, 1, effect_param1[CHORUS], effect_param2[CHORUS], effect_mix[CHORUS]);
+        }
+        if (effect_active[DELAY]) {
+            right = ProcessDelay(right, delay_buffer_r, effect_mix[DELAY]);
+        }
+        if (effect_active[PLATE_REVERB]) {
+            right = ProcessPlateReverb(right, 1, effect_param1[PLATE_REVERB], effect_mix[PLATE_REVERB]);
+        }
 
         write_ptr++; 
         if (write_ptr >= MAX_DELAY_SAMPLES) write_ptr = 0;
@@ -488,15 +502,21 @@ void AudioCallback(float **in, float **out, size_t size) {
 void setup() {
     pod = DAISY.init(DAISY_POD, AUDIO_SR_48K);
 
-    // Explicitly configure buttons if not auto-configured
-    pod.buttons[0].Init(pod.B7, 1.0f);  // Button 1
-    pod.buttons[1].Init(pod.B8, 1.0f);  // Button 2
-
     // --- INITIALISATION DU SUIVEUR D'ENVELOPPE ---
     // On utilise la fréquence d'échantillonnage définie par DAISY.init
     // 10ms pour l'attaque, 100ms pour le relâchement
-    //Mon conseil : Commencez avec 10/100. Si vous trouvez que votre pédale manque de "punch" sur les attaques, réduisez l'attaque vers 5 ms. Si vous trouvez que l'effet est trop instable ou "nerveux", augmentez le relâchement vers 150 ms ou 200 ms.
+    //Mon conseil : Commencez avec 10/100. Si vous trouvez que votre pédale manque de "punch" sur les attaques,
+    //réduisez l'attaque vers 5 ms. Si vous trouvez que l'effet est trop instable ou "nerveux", augmentez le relâchement vers 150 ms ou 200 ms.
     global_env.Init(AUDIO_SR_48K, 10.0f, 100.0f);
+    
+    // Initialize Daisy oscillators for LFOs
+    phaser_lfo_osc.Init(AUDIO_SR_48K);
+    phaser_lfo_osc.SetWaveform(Oscillator::WAVE_SIN);
+    phaser_lfo_osc.SetFreq(phaser_rate_hz);
+    
+    wah_lfo_osc.Init(AUDIO_SR_48K);
+    wah_lfo_osc.SetWaveform(Oscillator::WAVE_SIN);
+    wah_lfo_osc.SetFreq(wah_lfo_rate);
 
     for (int i = 0; i < NUM_SPRING_LINES; i++) {
         for (int j = 0; j < MAX_SPRING_BOUND; j++) {
@@ -520,10 +540,7 @@ void UpdateControls() {
     pod.DebounceControls(); // FIX: This single method automatically updates the encoder under the hood.
 
     // 3-Second Dual Hold Master Reset
-    bool button0_pressed = pod.buttons[0].Pressed();
-    bool button1_pressed = pod.buttons[1].Pressed();
-    
-    if (button0_pressed && button1_pressed) {
+    if (pod.buttons[0].Pressed() && pod.buttons[1].Pressed()) {
         if (!dual_hold_active) {
             dual_hold_active = true; 
             buttons_held_start_time = millis();
@@ -544,45 +561,35 @@ void UpdateControls() {
             current_effect = BOOST; knob1_hooked = false; knob2_hooked = false;
             is_flashing_reset = true; reset_flash_timer = millis(); dual_hold_active = false;
         }
-    } else { 
-        dual_hold_active = false;
+    } else { dual_hold_active = false; }
+
+    // Button 1: Cycle effect (RisingEdge detects press) - BEFORE reset flash
+    if (!dual_hold_active) {
+        if (pod.buttons[0].RisingEdge()) {
+            current_effect++; 
+            if (current_effect >= NUM_EFFECTS) current_effect = BOOST;
+            knob1_hooked = false; 
+            knob2_hooked = false;
+        }
+        if (pod.buttons[1].RisingEdge()) {
+            effect_active[current_effect] = !effect_active[current_effect];
+            if (effect_active[current_effect]) {
+                knob1_hooked = true; 
+                knob2_hooked = true;
+            }
+        }
     }
 
+    // Reset flash display (return won't block buttons - they already ran)
     if (is_flashing_reset) {
         if (millis() - reset_flash_timer < 300) {
             pod.leds[0].Set(0.5f, 0.0f, 0.0f); 
-            pod.leds[1].Set(0.5f, 0.0f, 0.0f);
+            pod.leds[1].Set(0.5f, 0.0f, 0.0f); 
+            return;
         } else { 
             is_flashing_reset = false; 
         }
     }
-
-    // DEBUG: Check if buttons are registering
-    if (button0_pressed) {
-        pod.leds[0].Set(1.0f, 1.0f, 1.0f);  // White when button 1 pressed
-    }
-    if (button1_pressed) {
-        pod.leds[1].Set(1.0f, 1.0f, 1.0f);  // White when button 2 pressed
-    }
-
-    // Button 1: Cycle effect (state-based edge detection on Pressed)
-    if (button0_pressed && !last_button0_state && !dual_hold_active) {
-        current_effect++; 
-        if (current_effect >= NUM_EFFECTS) current_effect = BOOST;
-        knob1_hooked = false; 
-        knob2_hooked = false;
-    }
-    last_button0_state = button0_pressed;
-    
-    // Button 2: Toggle effect on/off (state-based edge detection on Pressed)
-    if (button1_pressed && !last_button1_state && !dual_hold_active) {
-        effect_active[current_effect] = !effect_active[current_effect];
-        if (effect_active[current_effect]) {
-            knob1_hooked = true; 
-            knob2_hooked = true;
-        }
-    }
-    last_button1_state = button1_pressed;
 
     // FIX 2: Increased step size to 0.05f (5% per click). 
     // Since an encoder notch returns a raw integer 1 or -1, this requires exactly 20 notch turns 
@@ -608,6 +615,25 @@ void UpdateControls() {
     if (knob2_hooked) effect_param2[current_effect] = cur_k2;
 
     last_knob1_phys = cur_k1; last_knob2_phys = cur_k2;
+
+    // === OPTIMIZATION: Cache expensive parameter mappings (only computed on knob change) ===
+    // PHASER parameter caching (replaces per-sample powf calculations)
+    if (current_effect == PHASER && knob1_hooked) {
+        // Rate knob: 0.05 Hz to 10.0 Hz exponential mapping
+        phaser_rate_hz = 0.05f * powf(200.0f, effect_param1[PHASER]);
+        phaser_lfo_osc.SetFreq(phaser_rate_hz);
+    }
+    if (current_effect == PHASER && knob2_hooked) {
+        // Feedback knob: cubic bipolar mapping
+        phaser_feedback_val = 8.0f * powf(effect_param2[PHASER] - 0.5f, 3.0f);
+    }
+
+    // WAH parameter caching (LFO mode only)
+    if (current_effect == WAH && knob1_hooked && effect_param1[WAH] < 0.45f) {
+        // LFO rate: 0.1 Hz to 4.0 Hz when in LFO zone (0-45%)
+        wah_lfo_rate = 0.1f + ((effect_param1[WAH] / 0.45f) * 3.9f);
+        wah_lfo_osc.SetFreq(wah_lfo_rate);
+    }
 
    // LED 1 Menu Color Indicators - Luminosité fixe à 0.7
     // Skip normal LED updates during reset flash
