@@ -166,6 +166,8 @@ struct EnvelopeFollower {
 EnvelopeFollower global_env;
 float CurrentEnvelopeValue;
 
+
+
 float ProcessBoost(float input, int ch, float g, float t, float live_mix) {
     float gain = 1.0f + (g * 3.0f); 
     float boosted = input * gain;
@@ -333,24 +335,30 @@ float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, floa
     // Plage: 150 Hz à 3000 Hz (3000 / 150 = 20.0)
     float f_target = 150.0f * powf(20.0f, lfo_sine);
 
-    float current = input + (last_output[ch] * feedback_val);
+    // Clamp feedback to prevent runaway accumulation
+    float fb_safe = constrain(feedback_val, -0.85f, 0.85f);
+    float current = input + (last_output[ch] * fb_safe);
 
     // --- 4. LES 4 ÉTAGES ALL-PASS ---
     for (int stage = 0; stage < 4; stage++) {
-        // Ajout de l'imperfection analogique
-        float f_stage = f_target * imperfections[stage];
+        // Ajout de l'imperfection analogique, clamped
+        float f_stage = constrain(f_target * imperfections[stage], 10.0f, 18000.0f);
         
         // Calcul du coefficient de filtre bilinéaire
         float omega = PI * f_stage / 48000.0f;
-        float g = (1.0f - tanf(omega)) / (1.0f + tanf(omega));
+        //float g = (1.0f - tanf(omega)) / (1.0f + tanf(omega));
+        float g = (1.0f - omega) / (1.0f + omega);
 
-        // Application du filtre passe-tout
+        // Application du filtre passe-tout with normalization
         float ap_out = (g * current) + ap_state[ch][stage];
         ap_state[ch][stage] = current - (g * ap_out);
         current = ap_out;
     }
 
-    // Mémorisation pour la boucle de feedback
+    // Safety clipping after cascade to prevent signal blowup
+    current = constrain(current, -0.95f, 0.95f);
+
+    // Mémorisation pour la boucle de feedback (with safety clipping)
     last_output[ch] = current;
 
     // --- 5. MIXAGE PHASER & WET/DRY ---
