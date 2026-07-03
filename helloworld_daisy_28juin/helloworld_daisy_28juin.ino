@@ -4,7 +4,7 @@ DaisyHardware pod;
 
 /*
 ========================================================================================
-                         DAISY POD STUDIO RIG INTERFACE MANUAL
+                          DAISY POD STUDIO RIG INTERFACE MANUAL
 ========================================================================================
  [BUTTON 1] Cycle active menu slot     [BUTTON 2] Toggle selected effect ON / OFF
  [ENCODER]  Turn: Adjust Dry/Wet mix   [HOLD BOTH] Hold 1+2 for 3s to factory reset
@@ -12,19 +12,19 @@ DaisyHardware pod;
 ========================================================================================
 
 +---+───────────────+──────────────+────────────────────+──────────────────────────────+
-
 | # | EFFECT MODULE | LED 1 COLOR  | KNOB 1 ROLE        | KNOB 2 ROLE                  |
 +---+───────────────+──────────────+────────────────────+──────────────────────────────+
-
-| 1 | BOOST         | 🟡 Yellow     | Clean Boost Gain   | Treble / Tine Bark Tilt      |
-| 2 | OVERDRIVE     | 🔴 Red        | Drive Intensity    | High-End Tone Filter         |
-| 3 | WAH           | 🟠 Orange     | Filter Frequency   | Resonance Peak Sharpness     |
-| 4 | SPRING_REVERB | 🌸 Pink/Amber | Amp Spring Decay   | Tank Feedback Resonance      |
-| 5 | PHASER        | 🟢 Green      | Sweep Rate (LFO)   | Resonant Notch Feedback      |
-| 6 | CHORUS        | 🔵 Cyan       | Modulation Speed   | Delay Modulation Width       |
-| 7 | DELAY         | 🔵 Blue       | Echo Time Length   | Feedback Repeat Tails        |
-| 8 | PLATE_REVERB  | 🟣 Magenta    | Plate Room Size    | High Diffusion Space         |
+| 1 | BOOST         | 🟡 Yellow    | Clean Boost Gain   | Treble / Tine Bark Tilt      |
+| 2 | OVERDRIVE     | 🔴 Red       | Drive Intensity    | High-End Tone Filter         |
+| 3 | WAH           | 🟠 Orange    | Smart Macro Mode* | Resonance Peak Sharpness     |
+| 4 | SPRING_REVERB | 🌸 Magenta   | Amp Spring Decay   | Tank Feedback Resonance      |
+| 5 | PHASER        | 🟢 Green     | Sweep Rate (LFO)   | Resonant Notch Feedback      |
+| 6 | CHORUS        | 🔵 Cyan      | Modulation Speed   | Delay Modulation Width       |
+| 7 | DELAY         | 🔵 Blue      | Echo Time Length   | Feedback Repeat Tails        |
+| 8 | PLATE_REVERB  | 🟣 Violet    | Plate Room Size    | High Diffusion Space         |
 +---+───────────────+──────────────+────────────────────+──────────────────────────────+
+
+* WAH SMART MACRO: 0-45% = LFO Speed | 45-55% = Fixed "Cocked" Wah | 55-100% = Envelope Sensitivity
 
 ========================================================================================
                          SIGNAL PIPELINE & CONTROLS SPECIFICATION
@@ -75,6 +75,8 @@ unsigned long buttons_held_start_time = 0;
 bool dual_hold_active = false;
 unsigned long reset_flash_timer = 0;
 bool is_flashing_reset = false;
+bool last_button0_state = false;
+bool last_button1_state = false;
 
 #define MAX_DELAY_SAMPLES 48000
 float DSY_SDRAM_BSS delay_buffer_l[MAX_DELAY_SAMPLES];
@@ -106,11 +108,54 @@ float DSY_SDRAM_BSS plate_buf_l[NUM_PLATE_STAGES][MAX_PLATE_BOUND];
 float DSY_SDRAM_BSS plate_buf_r[NUM_PLATE_STAGES][MAX_PLATE_BOUND];
 int plate_ptrs[NUM_PLATE_STAGES] = {0, 0, 0, 0};
 
-float global_vol = 0.5f;
+float global_vol = 0.5f;  // Reduced for safe headroom before limiter
+
+// Soft-knee peak limiter to prevent clipping on stacked effects
+float ApplySoftLimiter(float sample) {
+    // Threshold at 0.85 to leave headroom
+    const float threshold = 0.85f;
+    
+    if (fabsf(sample) <= threshold) {
+        return sample;
+    }
+    
+    // Soft-knee limiting: reduce excess by 70%
+    float excess = fabsf(sample) - threshold;
+    float limited = threshold + (excess * 0.3f);
+    
+    if (sample < 0.0f) limited = -limited;
+    return limited;
+}
 
 float ApplyDryWet(float dry, float wet, float mix) {
     return (dry * (1.0f - mix)) + (wet * mix);
 }
+
+// À placer dans votre fichier header ou au-dessus de vos fonctions de traitement
+struct EnvelopeFollower {
+    float env;
+    float attack;
+    float release;
+
+    // Initialisation
+    void Init(float sample_rate, float attack_ms, float release_ms) {
+        env = 0.0f;
+        // Calcul des coefficients de lissage exponentiel
+        attack = expf(-1.0f / (attack_ms * 0.001f * sample_rate));
+        release = expf(-1.0f / (release_ms * 0.001f * sample_rate));
+    }
+
+    // Traitement : prend les deux canaux pour une réponse mono cohérente
+    float Process(float in_l, float in_r) {
+        float input = (fabsf(in_l) + fabsf(in_r)) * 0.5f; // Moyenne stéréo
+        float coeff = (input > env) ? attack : release;
+        env = input + coeff * (env - input);
+        return env;
+    }
+};
+// Instance globale (ou à passer par référence dans vos fonctions)
+EnvelopeFollower global_env;
+float CurrentEnvelopeValue;
 
 float ProcessBoost(float input, int ch, float g, float t, float live_mix) {
     float gain = 1.0f + (g * 3.0f); 
@@ -132,21 +177,116 @@ float ProcessOverdrive(float input, int ch, float drive, float tone, float live_
     return ApplyDryWet(input, lp_state[ch] * makeup_gain, live_mix);
 }
 
-float ProcessWah(float input, int ch, float freq, float res, float live_mix) {
+//(Touch-Wah + LFO combinés), Q fixe
+float ProcessWah_DualEngine(float input, int ch, float freq_knob, float res_knob, float live_mix) {
+    // Mémoires d'état stéréo
     static float d1[2] = {0.0f, 0.0f};
     static float d2[2] = {0.0f, 0.0f};
-    float target_freq = 200.0f + (freq * 2000.0f);
+    static float env[2] = {0.0f, 0.0f};
+    static float lfo_phase = 0.0f;
+
+    // --- 2. LFO ENGINE ---
+    // Mapping du knob 2 pour la vitesse (0.1 Hz à 4.0 Hz)
+    float lfo_rate_hz = 0.1f + (res_knob * 3.9f);
+    if (ch == 0) { // Mise à jour de la phase une seule fois par sample
+        lfo_phase += (2.0f * PI * lfo_rate_hz) / 48000.0f;
+        if (lfo_phase >= 2.0f * PI) lfo_phase -= 2.0f * PI;
+    }
+    // LFO normalisé entre 0.0 et 1.0
+    float lfo_val = (sinf(lfo_phase) * 0.5f) + 0.5f;
+
+    // --- 3. MODULATION MIX ---
+    // On combine l'enveloppe (multipliée par le knob 1 de sensibilité) et le LFO (profondeur fixe)
+    float env_mod = CurrentEnvelopeValue * (freq_knob * 12.0f); // Amplification de l'enveloppe
+    float mod = env_mod + (lfo_val * 0.3f); 
+    
+    // Sécurité pour garder le filtre dans sa plage de fonctionnement
+    if (mod > 1.0f) mod = 1.0f;
+    if (mod < 0.0f) mod = 0.0f;
+
+    // --- 4. STATE VARIABLE FILTER (SVF) ---
+    // Plage de fréquences : 300 Hz à 2200 Hz
+    float target_freq = 300.0f + (mod * 1900.0f);
     float f = 2.0f * sinf(PI * target_freq / 48000.0f);
-    f = constrain(f, 0.0f, 1.0f);
-    float q = 0.1f + (res * 0.85f);
-    float damping = 2.0f * (1.0f - q);
+    if (f > 1.0f) f = 1.0f;
+
+    // Résonance (Q) fixe et musicale. Damping ~0.25 équivaut à un Q de ~4.0.
+    float damping = 0.25f; 
+
+    // Calcul du SVF Chamberlin
     float hp = input - d2[ch] - (damping * d1[ch]);
     float bp = (f * hp) + d1[ch];
     float lp = (f * bp) + d2[ch];
-    d1[ch] = bp; d2[ch] = lp;
-    float wet = (bp * 0.7f) + (lp * 0.3f);
-    float attenuation = 1.0f - (res * 0.25f);
-    return ApplyDryWet(input, wet * attenuation, live_mix);
+    d1[ch] = bp; 
+    d2[ch] = lp;
+
+    // Le son Wah classique est un mélange (souvent 80% Passe-Bande, 20% Passe-Bas pour le corps)
+    float wet = (bp * 0.8f) + (lp * 0.2f);
+    
+    // --- 5. MIX DRY/WET OPTIMISÉ ---
+    // On boost légèrement le wet (* 1.5f) pour compenser la perte de volume inhérente aux filtres résonants
+    return (input * (1.0f - live_mix)) + (wet * live_mix * 1.5f);
+}
+
+// (Sélecteur de mode + Q ajustable) freq (Knob 1) : Sélecteur Macro. De 0 à 45% = LFO (Vitesse). De 45 à 55% = Fixe. De 55 à 100% = Enveloppe (Sensibilité).
+float ProcessWah_SmartMacro(float input, int ch, float freq_knob, float res_knob, float live_mix) {
+    static float d1[2] = {0.0f, 0.0f};
+    static float d2[2] = {0.0f, 0.0f};
+    static float env[2] = {0.0f, 0.0f};
+    static float lfo_phase = 0.0f;
+
+    // --- 2. MACRO LOGIC (Bouton 1 divisé en 3 zones) ---
+    float mod = 0.0f;
+    
+    if (freq_knob < 0.45f) {
+        // ZONE LFO (0% à 45%) : Contrôle de la vitesse
+        float lfo_rate = 0.1f + ((freq_knob / 0.45f) * 3.9f); // 0.1 à 4.0 Hz
+        if (ch == 0) {
+            lfo_phase += (2.0f * PI * lfo_rate) / 48000.0f;
+            if (lfo_phase >= 2.0f * PI) lfo_phase -= 2.0f * PI;
+        }
+        mod = (sinf(lfo_phase) * 0.5f) + 0.5f;
+    } 
+    else if (freq_knob > 0.55f) {
+        // ZONE ENVELOPE (55% à 100%) : Contrôle de la sensibilité
+        float sens = (freq_knob - 0.55f) / 0.45f; // Normalisé de 0.0 à 1.0
+        mod = CurrentEnvelopeValue * (sens * 15.0f); 
+        if (mod > 1.0f) mod = 1.0f;
+    } 
+    else {
+        // ZONE MORTE (45% à 55%) : Cocked Wah (Filtre bloqué dans les bas-médiums)
+        mod = 0.25f; 
+    }
+
+    // --- 3. STATE VARIABLE FILTER (SVF) ---
+    float target_freq = 300.0f + (mod * 1900.0f);
+    float f = 2.0f * sinf(PI * target_freq / 48000.0f);
+    if (f > 1.0f) f = 1.0f;
+
+    // --- 4. RÉSONANCE VARIABLE (Mappée sur le knob 2) ---
+    // Q varie de ~0.5 (très plat) à ~10.0 (très pointu). Le damping va de 2.0 à 0.1.
+    float damping = 2.0f - (res_knob * 1.9f); 
+    // Limite de sécurité stricte pour éviter l'explosion mathématique du filtre
+    if (damping < 0.05f) damping = 0.05f; 
+
+    // Calcul du SVF
+    float hp = input - d2[ch] - (damping * d1[ch]);
+    float bp = (f * hp) + d1[ch];
+    float lp = (f * bp) + d2[ch];
+    d1[ch] = bp; 
+    d2[ch] = lp;
+
+    float wet = (bp * 0.8f) + (lp * 0.2f);
+    
+    // On ajoute un rattrapage de gain dynamique basé sur la résonance
+    float make_up_gain = 1.0f + (res_knob * 1.5f);
+    
+    return (input * (1.0f - live_mix)) + (wet * live_mix * make_up_gain);
+}
+
+float ProcessWah(float input, int ch, float freq, float res, float live_mix) {
+    //return ProcessWah_DualEngine(input, ch, freq, res, live_mix)    ;
+    return ProcessWah_SmartMacro(input, ch, freq, res, live_mix) ;
 }
 
 float ProcessSpringReverb(float input, int ch, float size, float live_mix) {
@@ -171,24 +311,63 @@ float ProcessSpringReverb(float input, int ch, float size, float live_mix) {
 }
 
 float ProcessPhaser(float input, int ch, float rate, float feedback, float live_mix) {
-    static float ap_state[2][4] = {{0,0,0,0}, {0,0,0,0}};
+    // Mémoires d'état stéréo [canal][étage]
+    static float ap_state[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
     static float last_output[2] = {0.0f, 0.0f};
+    
+    // Constantes d'imperfection vintage (±4%)
+    const float imperfections[4] = {0.97f, 1.04f, 0.99f, 1.02f};
+
+    // --- 1. RATE KNOB (Exponentiel) ---
+    // Plage: 0.05 Hz à 10.0 Hz (10.0 / 0.05 = 200.0)
+    float rate_hz = 0.05f * powf(200.0f, rate);
+
+    // Le LFO n'est mis à jour qu'une seule fois par cycle d'échantillon (canal gauche)
     if (ch == 0) {
-        phaser_lfo_phase += (0.00001f + (rate * 0.0015f));
-        if (phaser_lfo_phase >= 1.0f) phaser_lfo_phase -= 1.0f;
+        float phase_inc = (2.0f * PI * rate_hz) / 48000.0f;
+        phaser_lfo_phase += phase_inc;
+        if (phaser_lfo_phase >= 2.0f * PI) {
+            phaser_lfo_phase -= 2.0f * PI;
+        }
     }
-    float tri_lfo = phaser_lfo_phase * 2.0f;
-    if (tri_lfo > 1.0f) tri_lfo = 2.0f - tri_lfo;
-    float g = 0.2f + (tri_lfo * 0.65f); 
-    float f_input = input + (last_output[ch] * (feedback * 0.85f));
-    float current = f_input;
+
+    // LFO sinusoïdal normalisé entre 0.0f et 1.0f
+    float lfo_sine = (sinf(phaser_lfo_phase) * 0.5f) + 0.5f;
+
+    // --- 2. SWEEP RANGE (Logarithmique) ---
+    // Plage: 150 Hz à 3000 Hz (3000 / 150 = 20.0)
+    float f_target = 150.0f * powf(20.0f, lfo_sine);
+
+    // --- 3. FEEDBACK (Cubique bipolaire) ---
+    // Centre (0.5) = 0.0 | Min (0.0) = -1.0 | Max (1.0) = +1.0
+    float fb_val = 8.0f * powf(feedback - 0.5f, 3.0f);
+
+    float current = input + (last_output[ch] * fb_val);
+
+    // --- 4. LES 4 ÉTAGES ALL-PASS ---
     for (int stage = 0; stage < 4; stage++) {
+        // Ajout de l'imperfection analogique
+        float f_stage = f_target * imperfections[stage];
+        
+        // Calcul du coefficient de filtre bilinéaire
+        float omega = PI * f_stage / 48000.0f;
+        float g = (1.0f - tanf(omega)) / (1.0f + tanf(omega));
+
+        // Application du filtre passe-tout
         float ap_out = (g * current) + ap_state[ch][stage];
         ap_state[ch][stage] = current - (g * ap_out);
         current = ap_out;
     }
+
+    // Mémorisation pour la boucle de feedback
     last_output[ch] = current;
-    return ApplyDryWet(input, current, live_mix);
+
+    // --- 5. MIXAGE PHASER & WET/DRY ---
+    // Le son "Phaser" authentique est créé en additionnant le Dry et le signal déphasé (50/50).
+    float phaser_wet_signal = (input * 0.5f) + (current * 0.5f);
+
+    // L'encodeur gère l'intensité globale via ApplyDryWet
+    return ApplyDryWet(input, phaser_wet_signal, live_mix);
 }
 
 float ProcessChorus(float input, int ch, float rate, float depth, float live_mix) {
@@ -239,11 +418,15 @@ float ProcessPlateReverb(float input, int ch, float size, float live_mix) {
     }
     return ApplyDryWet(input, accumulator / 4.0f, live_mix);
 }
+
 void AudioCallback(float **in, float **out, size_t size) {
     for (size_t i = 0; i < size; i++) {
         // FIX: Extract individual channel samples explicitly [channel][sample_index]
         float left = in[0][i]; 
         float right = in[1][i];
+        
+        // Envelope follower callback
+        CurrentEnvelopeValue = global_env.Process(left, right);
 
         float mix_boost  = effect_active[BOOST]   ? effect_mix[BOOST]   : 0.0f;
         float mix_drive  = effect_active[OVERDRIVE]? effect_mix[OVERDRIVE] : 0.0f;
@@ -279,9 +462,13 @@ void AudioCallback(float **in, float **out, size_t size) {
         chorus_write_ptr++; 
         if (chorus_write_ptr >= CHORUS_BUFFER_SIZE) chorus_write_ptr = 0;
 
+        // Apply soft-knee limiter to prevent clipping from stacked effects
+        left = ApplySoftLimiter(left* global_vol);
+        right = ApplySoftLimiter(right* global_vol);
+        
         // FIX: Route scalar sample variables cleanly back out to 2D channel outputs
-        out[0][i] = left * global_vol; 
-        out[1][i] = right * global_vol;
+        out[0][i] = left ; 
+        out[1][i] = right ;
     }
 }
 
@@ -300,6 +487,17 @@ void AudioCallback(float **in, float **out, size_t size) {
 
 void setup() {
     pod = DAISY.init(DAISY_POD, AUDIO_SR_48K);
+
+    // Explicitly configure buttons if not auto-configured
+    pod.buttons[0].Init(pod.B7, 1.0f);  // Button 1
+    pod.buttons[1].Init(pod.B8, 1.0f);  // Button 2
+
+    // --- INITIALISATION DU SUIVEUR D'ENVELOPPE ---
+    // On utilise la fréquence d'échantillonnage définie par DAISY.init
+    // 10ms pour l'attaque, 100ms pour le relâchement
+    //Mon conseil : Commencez avec 10/100. Si vous trouvez que votre pédale manque de "punch" sur les attaques, réduisez l'attaque vers 5 ms. Si vous trouvez que l'effet est trop instable ou "nerveux", augmentez le relâchement vers 150 ms ou 200 ms.
+    global_env.Init(AUDIO_SR_48K, 10.0f, 100.0f);
+
     for (int i = 0; i < NUM_SPRING_LINES; i++) {
         for (int j = 0; j < MAX_SPRING_BOUND; j++) {
             spring_buf_l[i][j] = 0.0f; spring_buf_r[i][j] = 0.0f;
@@ -313,7 +511,7 @@ void setup() {
     for (int i = 0; i < MAX_DELAY_SAMPLES; i++) {
         delay_buffer_l[i] = 0.0f; delay_buffer_r[i] = 0.0f;
     }
-    
+
     DAISY.begin(AudioCallback);
 }
 
@@ -322,9 +520,13 @@ void UpdateControls() {
     pod.DebounceControls(); // FIX: This single method automatically updates the encoder under the hood.
 
     // 3-Second Dual Hold Master Reset
-    if (pod.buttons[0].Pressed() && pod.buttons[1].Pressed()) {
+    bool button0_pressed = pod.buttons[0].Pressed();
+    bool button1_pressed = pod.buttons[1].Pressed();
+    
+    if (button0_pressed && button1_pressed) {
         if (!dual_hold_active) {
-            dual_hold_active = true; buttons_held_start_time = millis();
+            dual_hold_active = true; 
+            buttons_held_start_time = millis();
         }
         if (millis() - buttons_held_start_time >= 3000) {
             for (int i = 0; i < NUM_EFFECTS; i++) effect_active[i] = false;
@@ -342,26 +544,45 @@ void UpdateControls() {
             current_effect = BOOST; knob1_hooked = false; knob2_hooked = false;
             is_flashing_reset = true; reset_flash_timer = millis(); dual_hold_active = false;
         }
-    } else { dual_hold_active = false; }
+    } else { 
+        dual_hold_active = false;
+    }
 
     if (is_flashing_reset) {
         if (millis() - reset_flash_timer < 300) {
-            pod.leds[0].Set(0.5f, 0.0f, 0.0f); pod.leds[1].Set(0.5f, 0.0f, 0.0f); return;
-        } else { is_flashing_reset = false; }
+            pod.leds[0].Set(0.5f, 0.0f, 0.0f); 
+            pod.leds[1].Set(0.5f, 0.0f, 0.0f);
+        } else { 
+            is_flashing_reset = false; 
+        }
     }
 
-    if (!dual_hold_active) {
-        if (pod.buttons[0].RisingEdge()) {
-            current_effect++; if (current_effect >= NUM_EFFECTS) current_effect = BOOST;
-            knob1_hooked = false; knob2_hooked = false;
-        }
-        if (pod.buttons[1].RisingEdge()) {
-            effect_active[current_effect] = !effect_active[current_effect];
-            if (effect_active[current_effect]) {
-                knob1_hooked = true; knob2_hooked = true;
-            }
+    // DEBUG: Check if buttons are registering
+    if (button0_pressed) {
+        pod.leds[0].Set(1.0f, 1.0f, 1.0f);  // White when button 1 pressed
+    }
+    if (button1_pressed) {
+        pod.leds[1].Set(1.0f, 1.0f, 1.0f);  // White when button 2 pressed
+    }
+
+    // Button 1: Cycle effect (state-based edge detection on Pressed)
+    if (button0_pressed && !last_button0_state && !dual_hold_active) {
+        current_effect++; 
+        if (current_effect >= NUM_EFFECTS) current_effect = BOOST;
+        knob1_hooked = false; 
+        knob2_hooked = false;
+    }
+    last_button0_state = button0_pressed;
+    
+    // Button 2: Toggle effect on/off (state-based edge detection on Pressed)
+    if (button1_pressed && !last_button1_state && !dual_hold_active) {
+        effect_active[current_effect] = !effect_active[current_effect];
+        if (effect_active[current_effect]) {
+            knob1_hooked = true; 
+            knob2_hooked = true;
         }
     }
+    last_button1_state = button1_pressed;
 
     // FIX 2: Increased step size to 0.05f (5% per click). 
     // Since an encoder notch returns a raw integer 1 or -1, this requires exactly 20 notch turns 
@@ -388,38 +609,43 @@ void UpdateControls() {
 
     last_knob1_phys = cur_k1; last_knob2_phys = cur_k2;
 
-    // LED 1 Menu Color Indicators
-    float b = 0.3f; 
-    switch (current_effect) {
-        case BOOST:         pod.leds[0].Set(b, b, 0.0f); break; 
-        case OVERDRIVE:     pod.leds[0].Set(b, 0.0f, 0.0f); break; 
-        case WAH:           pod.leds[0].Set(b, b * 0.5f, 0.0f); break;
-        case SPRING_REVERB: pod.leds[0].Set(b, b * 0.2f, b * 0.4f); break;
-        case PHASER:        pod.leds[0].Set(0.0f, b, 0.0f); break; 
-        case CHORUS:        pod.leds[0].Set(0.0f, b, b); break; 
-        case DELAY:         pod.leds[0].Set(0.0f, 0.0f, b); break; 
-        case PLATE_REVERB:  pod.leds[0].Set(b, 0.0f, b); break; 
-    }
-
-       // LED 2 Discrete 10-Step Visual Feedback
-    if (!effect_active[current_effect]) {
-        pod.leds[1].Set(b, 0.0f, 0.0f); // Solid Red ALWAYS means bypassed
-    } else {
-        int step = (int)(effect_mix[current_effect] * 10.0f + 0.5f);
+   // LED 1 Menu Color Indicators - Luminosité fixe à 0.7
+    // Skip normal LED updates during reset flash
+    if (!is_flashing_reset) {
+        float b = 0.7f; 
         
-        switch(step) {
-            case 0:  pod.leds[1].Set(0.0f, 0.0f, b);     break; //   0% Mix: Pure Blue
-            case 1:  pod.leds[1].Set(0.0f, b * 0.2f, b); break; //  10% Mix: Deep Sapphire
-            case 2:  pod.leds[1].Set(0.0f, b * 0.4f, b); break; //  20% Mix: Ice Blue
-            case 3:  pod.leds[1].Set(0.0f, b * 0.6f, b); break; //  30% Mix: Light Cyan
-            case 4:  pod.leds[1].Set(0.0f, b * 0.8f, b); break; //  40% Mix: Electric Electric
-            case 5:  pod.leds[1].Set(0.0f, b, b);       break; //  50% Mix: Pure Cyan (Equal Green/Blue)
-            case 6:  pod.leds[1].Set(0.0f, b, b * 0.7f); break; //  60% Mix: Deep Teal
-            case 7:  pod.leds[1].Set(0.0f, b, b * 0.4f); break; //  70% Mix: Mint Green
-            case 8:  pod.leds[1].Set(b * 0.2f, b, 0.0f); break; //  80% Mix: Lime/Chartreuse
-            case 9:  pod.leds[1].Set(b * 0.5f, b, 0.0f); break; //  90% Mix: Yellow-Green
-            case 10: pod.leds[1].Set(0.0f, b, 0.0f);     break; // 100% Mix: Pure Green
-            default: pod.leds[1].Set(0.0f, 0.0f, b);     break;
+        switch (current_effect) {
+            // Couleurs franches pour un contraste maximal sous les projecteurs
+            case BOOST:         pod.leds[0].Set(b, b * 0.8f, 0.0f); break; // Jaune orangé
+            case OVERDRIVE:     pod.leds[0].Set(b, 0.0f, 0.0f);     break; // Rouge pur
+            case WAH:           pod.leds[0].Set(b, b * 0.5f, 0.0f); break; // Orange vif
+            case SPRING_REVERB: pod.leds[0].Set(b, 0.0f, b * 0.5f); break; // Magenta
+            case PHASER:        pod.leds[0].Set(0.0f, b, 0.0f);     break; // Vert pur
+            case CHORUS:        pod.leds[0].Set(0.0f, b, b);        break; // Cyan
+            case DELAY:         pod.leds[0].Set(0.0f, 0.0f, b);     break; // Bleu pur
+            case PLATE_REVERB:  pod.leds[0].Set(b * 0.8f, 0.0f, b); break; // Violet
+        }
+
+           // LED 2 Discrete 10-Step Visual Feedback
+        if (!effect_active[current_effect]) {
+            pod.leds[1].Set(b, 0.0f, 0.0f); // Solid Red ALWAYS means bypassed
+        } else {
+            int step = (int)(effect_mix[current_effect] * 10.0f + 0.5f);
+            
+            switch(step) {
+                case 0:  pod.leds[1].Set(0.0f, 0.0f, b);     break; //   0% Mix: Pure Blue
+                case 1:  pod.leds[1].Set(0.0f, b * 0.2f, b); break; //  10% Mix: Deep Sapphire
+                case 2:  pod.leds[1].Set(0.0f, b * 0.4f, b); break; //  20% Mix: Ice Blue
+                case 3:  pod.leds[1].Set(0.0f, b * 0.6f, b); break; //  30% Mix: Light Cyan
+                case 4:  pod.leds[1].Set(0.0f, b * 0.8f, b); break; //  40% Mix: Electric Electric
+                case 5:  pod.leds[1].Set(0.0f, b, b);       break; //  50% Mix: Pure Cyan (Equal Green/Blue)
+                case 6:  pod.leds[1].Set(0.0f, b, b * 0.7f); break; //  60% Mix: Deep Teal
+                case 7:  pod.leds[1].Set(0.0f, b, b * 0.4f); break; //  70% Mix: Mint Green
+                case 8:  pod.leds[1].Set(b * 0.2f, b, 0.0f); break; //  80% Mix: Lime/Chartreuse
+                case 9:  pod.leds[1].Set(b * 0.5f, b, 0.0f); break; //  90% Mix: Yellow-Green
+                case 10: pod.leds[1].Set(0.0f, b, 0.0f);     break; // 100% Mix: Pure Green
+                default: pod.leds[1].Set(0.0f, 0.0f, b);     break;
+            }
         }
     }
 
