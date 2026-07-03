@@ -317,23 +317,22 @@ float ProcessSpringReverb(float input, int ch, float size, float live_mix) {
     return ApplyDryWet(input, wet_accum / 3.0f, live_mix);
 }
 
-float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
-    // Mémoires d'état stéréo [canal][étage]
+// Mémoires d'état stéréo [canal][étage]
     static float ap_state[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
     static float last_output[2] = {0.0f, 0.0f};
-    
+
+float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
+        
     // Constantes d'imperfection vintage (±4%)
     const float imperfections[4] = {0.97f, 1.04f, 0.99f, 1.02f};
 
-    // OPTIMIZED: rate_hz and feedback_val are pre-computed in UpdateControls() and passed as arguments
-    // No global state - all parameters passed explicitly
-    
     // LFO output from Daisy oscillator (efficient vs manual sinf)
     float lfo_sine = (phaser_lfo_osc.Process() * 0.5f) + 0.5f;
 
     // --- 2. SWEEP RANGE (Logarithmique) ---
     // Plage: 150 Hz à 3000 Hz (3000 / 150 = 20.0)
-    float f_target = 150.0f * powf(20.0f, lfo_sine);
+   // float f_target = 150.0f * powf(20.0f, lfo_sine);
+    float f_target = 150.0f + (lfo_sine * 2200.0f); // Linéaire au lieu de powf (plus rapide)
 
     // Clamp feedback to prevent runaway accumulation
     float fb_safe = constrain(feedback_val, -0.85f, 0.85f);
@@ -345,25 +344,39 @@ float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, floa
         float f_stage = constrain(f_target * imperfections[stage], 10.0f, 18000.0f);
         
         // Calcul du coefficient de filtre bilinéaire
-        float omega = PI * f_stage / 48000.0f;
+        //float omega = PI * f_stage / 48000.0f;
+        float w = 2.0f * PI * f_stage / 48000.0f;
         //float g = (1.0f - tanf(omega)) / (1.0f + tanf(omega));
-        float g = (1.0f - omega) / (1.0f + omega);
+        //float g = (1.0f - omega) / (1.0f + omega);
+        // FIX 3: Coefficient all-pass stable (1er ordre)
+        // g = (1 - w/2) / (1 + w/2) est une approximation standard
+        float g = (1.0f - 0.5f * w) / (1.0f + 0.5f * w);
 
         // Application du filtre passe-tout with normalization
-        float ap_out = (g * current) + ap_state[ch][stage];
-        ap_state[ch][stage] = current - (g * ap_out);
-        current = ap_out;
-    }
+        //float ap_out = (g * current) + ap_state[ch][stage];
+        //ap_state[ch][stage] = current - (g * ap_out);
+        //current = ap_out;
 
-    // Safety clipping after cascade to prevent signal blowup
-    current = constrain(current, -0.95f, 0.95f);
+        // All-pass stable (Formule de Schroeder)
+        float ap_in = current;
+        float ap_out = (g * ap_in) + ap_state[ch][stage];
+        ap_state[ch][stage] = ap_in - (g * ap_out);
+        current = ap_out; // On avance l'étage suivant avec la sortie filtrée
+
+    }
 
     // Mémorisation pour la boucle de feedback (with safety clipping)
     last_output[ch] = current;
 
+    // Safety clipping after cascade to prevent signal blowup
+    current = constrain(current, -0.95f, 0.95f);
+
+
+
     // --- 5. MIXAGE PHASER & WET/DRY ---
     // Le son "Phaser" authentique est créé en additionnant le Dry et le signal déphasé (50/50).
-    float phaser_wet_signal = (input * 0.5f) + (current * 0.5f);
+    //float phaser_wet_signal = (input * 0.5f) + (current * 0.5f);
+    float phaser_wet_signal = (input) - (current);
 
     // L'encodeur gère l'intensité globale via ApplyDryWet
     return ApplyDryWet(input, phaser_wet_signal, live_mix);
@@ -418,7 +431,11 @@ float ProcessPlateReverb(float input, int ch, float size, float live_mix) {
     return ApplyDryWet(input, accumulator / 4.0f, live_mix);
 }
 
+
 void AudioCallback(float **in, float **out, size_t size) {
+    //pod.ProcessAllControls();
+
+
     for (size_t i = 0; i < size; i++) {
         // FIX: Extract individual channel samples explicitly [channel][sample_index]
         float left = in[0][i]; 
@@ -544,8 +561,9 @@ void setup() {
 }
 
 void UpdateControls() {
-    pod.ProcessAnalogControls(); 
-    pod.DebounceControls(); // FIX: This single method automatically updates the encoder under the hood.
+    //pod.ProcessAnalogControls(); 
+    pod.ProcessAllControls();
+    //pod.DebounceControls(); // FIX: This single method automatically updates the encoder under the hood.
 
     // 3-Second Dual Hold Master Reset
     if (pod.buttons[0].Pressed() && pod.buttons[1].Pressed()) {
@@ -608,8 +626,10 @@ void UpdateControls() {
         effect_mix[current_effect] = constrain(effect_mix[current_effect], 0.0f, 1.0f);
     }
 
-    float cur_k1 = analogRead(PIN_POD_POT_1) / 1023.0f;
-    float cur_k2 = analogRead(PIN_POD_POT_2) / 1023.0f;
+    //float cur_k1 = analogRead(PIN_POD_POT_1) / 1023.0f;
+    // my_freq.Init(pod.knob1, 55.0f, 880.0f, Parameter::LOGARITHMIC);
+    float cur_k1 = pod.GetKnobValue(0);
+    float cur_k2 = pod.GetKnobValue(1);
     float s_p1 = effect_param1[current_effect]; float s_p2 = effect_param2[current_effect];
 
     if (!knob1_hooked) {
@@ -627,8 +647,11 @@ void UpdateControls() {
     // === OPTIMIZATION: Cache expensive parameter mappings (only computed on knob change) ===
     // PHASER parameter caching (replaces per-sample powf calculations)
     if (current_effect == PHASER && knob1_hooked) {
-        // Rate knob: 0.05 Hz to 10.0 Hz exponential mapping
-        phaser_rate_hz = 0.05f * powf(200.0f, effect_param1[PHASER]);
+        // Rate knob: 0.05 Hz to 10.0 Hz exponential mapping 
+        //float phaser_rate_hz = f_min * exp2f(val * log2f(f_max / f_min));
+        //phaser_rate_hz = 0.05f * powf(200.0f, effect_param1[PHASER]);  // $0.05 \times 200^1 = 10.0 \text{ Hz}$
+        //7.64 =  log2f(10.0f / 0.05)
+        phaser_rate_hz = 0.05f * exp2f(effect_param1[PHASER] * 7.64f);
         phaser_lfo_osc.SetFreq(phaser_rate_hz);
     }
     if (current_effect == PHASER && knob2_hooked) {
@@ -666,19 +689,19 @@ void UpdateControls() {
         } else {
             int step = (int)(effect_mix[current_effect] * 10.0f + 0.5f);
             
-            switch(step) {
-                case 0:  pod.leds[1].Set(0.0f, 0.0f, b);     break; //   0% Mix: Pure Blue
-                case 1:  pod.leds[1].Set(0.0f, b * 0.2f, b); break; //  10% Mix: Deep Sapphire
-                case 2:  pod.leds[1].Set(0.0f, b * 0.4f, b); break; //  20% Mix: Ice Blue
-                case 3:  pod.leds[1].Set(0.0f, b * 0.6f, b); break; //  30% Mix: Light Cyan
-                case 4:  pod.leds[1].Set(0.0f, b * 0.8f, b); break; //  40% Mix: Electric Electric
-                case 5:  pod.leds[1].Set(0.0f, b, b);       break; //  50% Mix: Pure Cyan (Equal Green/Blue)
-                case 6:  pod.leds[1].Set(0.0f, b, b * 0.7f); break; //  60% Mix: Deep Teal
-                case 7:  pod.leds[1].Set(0.0f, b, b * 0.4f); break; //  70% Mix: Mint Green
-                case 8:  pod.leds[1].Set(b * 0.2f, b, 0.0f); break; //  80% Mix: Lime/Chartreuse
-                case 9:  pod.leds[1].Set(b * 0.5f, b, 0.0f); break; //  90% Mix: Yellow-Green
-                case 10: pod.leds[1].Set(0.0f, b, 0.0f);     break; // 100% Mix: Pure Green
-                default: pod.leds[1].Set(0.0f, 0.0f, b);     break;
+        switch(step) {
+            case 0:  pod.leds[1].Set(0.0f, 0.0f, b);     break; //   0% Mix: Pure Blue
+            case 1:  pod.leds[1].Set(b, b * 0.4f, 0.0f); break; //  10% Mix: Vibrant Orange (Jumps far from Blue)
+            case 2:  pod.leds[1].Set(0.0f, b, b);        break; //  20% Mix: Electric Cyan
+            case 3:  pod.leds[1].Set(b, 0.0f, b * 0.5f); break; //  30% Mix: Bright Magenta/Pink
+            case 4:  pod.leds[1].Set(0.0f, b, 0.0f);     break; //  40% Mix: Pure Green
+            case 5:  pod.leds[1].Set(b, b, 0.0f);        break; //  50% Mix: Bright Yellow
+            case 6:  pod.leds[1].Set(0.0f, b * 0.3f, b); break; //  60% Mix: Deep Sapphire Blue
+            case 7:  pod.leds[1].Set(b, 0.0f, b);        break; //  70% Mix: Intense Purple
+            case 8:  pod.leds[1].Set(b * 0.3f, b, 0.0f); break; //  80% Mix: Lime Green
+            case 9:  pod.leds[1].Set(b, b * 0.2f, b);    break; //  90% Mix: Pastel Rose
+            case 10: pod.leds[1].Set(b, b, b);           break; // 100% Mix: Pure White (All channels maxed)
+            default: pod.leds[1].Set(0.0f, 0.0f, b);     break; // Default fallback
             }
         }
     }
