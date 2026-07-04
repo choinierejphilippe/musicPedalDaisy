@@ -71,6 +71,8 @@ bool knob2_hooked = false;
 float last_knob1_phys = 0.0f;
 float last_knob2_phys = 0.0f;
 
+float sample_rate_global = 48000.0f; 
+
 unsigned long buttons_held_start_time = 0;
 bool dual_hold_active = false;
 unsigned long reset_flash_timer = 0;
@@ -89,7 +91,9 @@ float chorus_lfo_phase = 0.0f;
 
 // Daisy Oscillators for efficient LFO generation (replaces manual sinf)
 Oscillator phaser_lfo_osc;
+float current_phaser_lfo_osc = 0;
 Oscillator wah_lfo_osc;
+float current_wah_lfo_osc = 0;
 
 // Cached parameters (computed only in UpdateControls, not every sample)
 // PHASER caches
@@ -167,6 +171,7 @@ EnvelopeFollower global_env;
 float CurrentEnvelopeValue;
 
 
+//---------------------- FX -------------------
 
 float ProcessBoost(float input, int ch, float g, float t, float live_mix) {
     float gain = 1.0f + (g * 3.0f); 
@@ -251,7 +256,7 @@ float ProcessWah_SmartMacro(float input, int ch, float freq_knob, float res_knob
     if (freq_knob < 0.45f) {
         // ZONE LFO (0% à 45%) : Uses pre-computed wah_lfo_rate from UpdateControls
         // Daisy oscillator handles the sinf() efficiently
-        float lfo_val = (wah_lfo_osc.Process() * 0.5f) + 0.5f;
+        float lfo_val = (current_wah_lfo_osc * 0.5f) + 0.5f;
         mod = lfo_val;
     } 
     else if (freq_knob > 0.55f) {
@@ -322,35 +327,44 @@ float ProcessSpringReverb(float input, int ch, float size, float live_mix) {
     static float last_output[2] = {0.0f, 0.0f};
 
 float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
-        
+              
     // Constantes d'imperfection vintage (±4%)
-    const float imperfections[4] = {0.97f, 1.04f, 0.99f, 1.02f};
-
+    //const float imperfections[4] = {0.97f, 1.04f, 0.99f, 1.02f};
+const float imperfections[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     // LFO output from Daisy oscillator (efficient vs manual sinf)
-    float lfo_sine = (phaser_lfo_osc.Process() * 0.5f) + 0.5f;
+    float lfo_sine = (current_phaser_lfo_osc * 0.5f) + 0.5f;
 
     // --- 2. SWEEP RANGE (Logarithmique) ---
     // Plage: 150 Hz à 3000 Hz (3000 / 150 = 20.0)
    // float f_target = 150.0f * powf(20.0f, lfo_sine);
-    float f_target = 150.0f + (lfo_sine * 2200.0f); // Linéaire au lieu de powf (plus rapide)
+   // float f_target = 150.0f + (lfo_sine * 2200.0f); // Linéaire au lieu de powf (plus rapide)
+    float f_target = 150.0f + (rate_hz * 2200.0f); // Linéaire au lieu de powf (plus rapide)
 
     // Clamp feedback to prevent runaway accumulation
-    float fb_safe = constrain(feedback_val, -0.85f, 0.85f);
-    float current = input + (last_output[ch] * fb_safe);
+    //float fb_safe = constrain(feedback_val, -0.85f, 0.85f);
+
+    static float feedback_filter[2] = {0.0f, 0.0f};
+    float fb_signal = last_output[ch] * feedback_val;
+
+    // Passe-bas simple sur le feedback (évite l'instabilité dans les hautes)
+    feedback_filter[ch] = (fb_signal * 0.2f) + (feedback_filter[ch] * 0.8f);
+
+    float current = input +  feedback_filter[ch];
+    //current = SoftClip(current);
 
     // --- 4. LES 4 ÉTAGES ALL-PASS ---
     for (int stage = 0; stage < 4; stage++) {
         // Ajout de l'imperfection analogique, clamped
-        float f_stage = constrain(f_target * imperfections[stage], 10.0f, 18000.0f);
+        float f_stage = constrain(f_target * imperfections[stage], 100.0f, 3000.0f);
         
         // Calcul du coefficient de filtre bilinéaire
         //float omega = PI * f_stage / 48000.0f;
-        float w = 2.0f * PI * f_stage / 48000.0f;
+        float w = tanf( PI * f_stage / sample_rate_global);
         //float g = (1.0f - tanf(omega)) / (1.0f + tanf(omega));
         //float g = (1.0f - omega) / (1.0f + omega);
         // FIX 3: Coefficient all-pass stable (1er ordre)
         // g = (1 - w/2) / (1 + w/2) est une approximation standard
-        float g = (1.0f - 0.5f * w) / (1.0f + 0.5f * w);
+        float g = (1.0f - w) / (1.0f + w);
 
         // Application du filtre passe-tout with normalization
         //float ap_out = (g * current) + ap_state[ch][stage];
@@ -361,22 +375,17 @@ float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, floa
         float ap_in = current;
         float ap_out = (g * ap_in) + ap_state[ch][stage];
         ap_state[ch][stage] = ap_in - (g * ap_out);
-        current = ap_out; // On avance l'étage suivant avec la sortie filtrée
-
+        current = ap_out;
+        //current = SoftClip(ap_out); // On avance l'étage suivant avec la sortie filtrée
     }
 
     // Mémorisation pour la boucle de feedback (with safety clipping)
     last_output[ch] = current;
 
-    // Safety clipping after cascade to prevent signal blowup
-    current = constrain(current, -0.95f, 0.95f);
-
-
-
     // --- 5. MIXAGE PHASER & WET/DRY ---
     // Le son "Phaser" authentique est créé en additionnant le Dry et le signal déphasé (50/50).
     //float phaser_wet_signal = (input * 0.5f) + (current * 0.5f);
-    float phaser_wet_signal = (input) - (current);
+    float phaser_wet_signal = (input - current) * 0.5f;
 
     // L'encodeur gère l'intensité globale via ApplyDryWet
     return ApplyDryWet(input, phaser_wet_signal, live_mix);
@@ -443,6 +452,8 @@ void AudioCallback(float **in, float **out, size_t size) {
         
         // Envelope follower callback
         CurrentEnvelopeValue = global_env.Process(left, right);
+        current_phaser_lfo_osc = phaser_lfo_osc.Process();
+        current_wah_lfo_osc = wah_lfo_osc.Process();
 
         // --- LEFT RIG INS-CHANNEL FLOW (only process active effects) ---
         if (effect_active[BOOST]) {
@@ -458,7 +469,7 @@ void AudioCallback(float **in, float **out, size_t size) {
             left = ProcessSpringReverb(left, 0, effect_param1[SPRING_REVERB], effect_mix[SPRING_REVERB]);
         }
         if (effect_active[PHASER]) {
-            left = ProcessPhaser(left, 0, phaser_rate_hz, phaser_feedback_val, effect_mix[PHASER]);
+            left = ProcessPhaser(left, 0, effect_param1[PHASER],phaser_feedback_val, effect_mix[PHASER]);
         }
         if (effect_active[CHORUS]) {
             left = ProcessChorus(left, 0, effect_param1[CHORUS], effect_param2[CHORUS], effect_mix[CHORUS]);
@@ -484,7 +495,8 @@ void AudioCallback(float **in, float **out, size_t size) {
             right = ProcessSpringReverb(right, 1, effect_param1[SPRING_REVERB], effect_mix[SPRING_REVERB]);
         }
         if (effect_active[PHASER]) {
-            right = ProcessPhaser(right, 1, phaser_rate_hz, phaser_feedback_val, effect_mix[PHASER]);
+            //right = ProcessPhaser(right, 1, phaser_rate_hz, phaser_feedback_val, effect_mix[PHASER]);
+            right = ProcessPhaser(right, 1,effect_param1[PHASER], phaser_feedback_val, effect_mix[PHASER]);
         }
         if (effect_active[CHORUS]) {
             right = ProcessChorus(right, 1, effect_param1[CHORUS], effect_param2[CHORUS], effect_mix[CHORUS]);
@@ -512,18 +524,6 @@ void AudioCallback(float **in, float **out, size_t size) {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 void setup() {
     pod = DAISY.init(DAISY_POD, AUDIO_SR_48K);
 
@@ -537,7 +537,11 @@ void setup() {
     // Initialize Daisy oscillators for LFOs
     phaser_lfo_osc.Init(AUDIO_SR_48K);
     phaser_lfo_osc.SetWaveform(Oscillator::WAVE_SIN);
-    phaser_lfo_osc.SetFreq(phaser_rate_hz);
+    phaser_lfo_osc.SetFreq(0.5f);
+    phaser_lfo_osc.SetAmp(1.0f);
+    // Exemple : Décalage de phase pour effet stéréo
+    //phaser_lfo_osc_left.SetPhase(0.0f);
+    //phaser_lfo_osc_right.SetPhase(0.25f); // Décalage de 90 degrés
     
     wah_lfo_osc.Init(AUDIO_SR_48K);
     wah_lfo_osc.SetWaveform(Oscillator::WAVE_SIN);
@@ -651,12 +655,13 @@ void UpdateControls() {
         //float phaser_rate_hz = f_min * exp2f(val * log2f(f_max / f_min));
         //phaser_rate_hz = 0.05f * powf(200.0f, effect_param1[PHASER]);  // $0.05 \times 200^1 = 10.0 \text{ Hz}$
         //7.64 =  log2f(10.0f / 0.05)
-        phaser_rate_hz = 0.05f * exp2f(effect_param1[PHASER] * 7.64f);
+        //phaser_rate_hz = 0.05f * exp2f(effect_param1[PHASER] * 7.64f);
+        phaser_rate_hz = 0.05f + effect_param1[PHASER] * 10.0f;
         phaser_lfo_osc.SetFreq(phaser_rate_hz);
     }
     if (current_effect == PHASER && knob2_hooked) {
         // Feedback knob: cubic bipolar mapping
-        phaser_feedback_val = 8.0f * powf(effect_param2[PHASER] - 0.5f, 3.0f);
+        phaser_feedback_val = 7.9f * powf(effect_param2[PHASER] - 0.5f, 3.0f);
     }
 
     // WAH parameter caching (LFO mode only)
