@@ -95,6 +95,7 @@ float current_phaser_lfo_osc = 0;
 Oscillator wah_lfo_osc;
 float current_wah_lfo_osc = 0;
 
+
 // Cached parameters (computed only in UpdateControls, not every sample)
 // PHASER caches
 float phaser_rate_hz = 0.05f;      // Pre-computed from effect_param1[PHASER]
@@ -327,6 +328,25 @@ float ProcessSpringReverb(float input, int ch, float size, float live_mix) {
     static float last_output[2] = {0.0f, 0.0f};
 
 float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
+    return DefaultPhaser(input, ch, rate_hz, feedback_val, live_mix);
+   // return CustomJpsProcessPhaser(input, ch, rate_hz, feedback_val, live_mix);
+}
+
+Phaser DefaultPhaserL;
+Phaser DefaultPhaserR;
+float DefaultPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
+    if(ch=0)
+    {
+        return DefaultPhaserL.Process(input);
+    }
+    else
+    {
+        return DefaultPhaserR.Process(input);
+    }
+
+}
+
+float CustomJpsProcessPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
               
     // Constantes d'imperfection vintage (±4%)
     //const float imperfections[4] = {0.97f, 1.04f, 0.99f, 1.02f};
@@ -338,7 +358,7 @@ const float imperfections[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     // Plage: 150 Hz à 3000 Hz (3000 / 150 = 20.0)
    // float f_target = 150.0f * powf(20.0f, lfo_sine);
    // float f_target = 150.0f + (lfo_sine * 2200.0f); // Linéaire au lieu de powf (plus rapide)
-    float f_target = 150.0f + (rate_hz * 2200.0f); // Linéaire au lieu de powf (plus rapide)
+    float f_target = 150.0f + (lfo_sine * 2200.0f); // Linéaire au lieu de powf (plus rapide)
 
     // Clamp feedback to prevent runaway accumulation
     //float fb_safe = constrain(feedback_val, -0.85f, 0.85f);
@@ -539,6 +559,22 @@ void setup() {
     phaser_lfo_osc.SetWaveform(Oscillator::WAVE_SIN);
     phaser_lfo_osc.SetFreq(0.5f);
     phaser_lfo_osc.SetAmp(1.0f);
+    
+    DefaultPhaserL.Init(AUDIO_SR_48K);
+    DefaultPhaserL.SetFreq(1500.0f);
+    DefaultPhaserL.SetFeedback(0.7f);
+    DefaultPhaserL.SetLfoDepth(0.3f);    
+    DefaultPhaserL.SetLfoFreq(5.0f);
+    DefaultPhaserL.SetPoles(4);
+
+    DefaultPhaserR.Init(AUDIO_SR_48K);
+    DefaultPhaserR.SetFreq(1500.0f);
+    DefaultPhaserR.SetFeedback(0.7f);
+    DefaultPhaserR.SetLfoDepth(0.3f);    
+    DefaultPhaserR.SetLfoFreq(5.0f);
+    DefaultPhaserR.SetPoles(4);
+    
+
     // Exemple : Décalage de phase pour effet stéréo
     //phaser_lfo_osc_left.SetPhase(0.0f);
     //phaser_lfo_osc_right.SetPhase(0.25f); // Décalage de 90 degrés
@@ -634,7 +670,8 @@ void UpdateControls() {
     // my_freq.Init(pod.knob1, 55.0f, 880.0f, Parameter::LOGARITHMIC);
     float cur_k1 = pod.GetKnobValue(0);
     float cur_k2 = pod.GetKnobValue(1);
-    float s_p1 = effect_param1[current_effect]; float s_p2 = effect_param2[current_effect];
+    float s_p1 = effect_param1[current_effect]; 
+    float s_p2 = effect_param2[current_effect];
 
     if (!knob1_hooked) {
         if ((last_knob1_phys <= s_p1 && cur_k1 >= s_p1) || (last_knob1_phys >= s_p1 && cur_k1 <= s_p1) || abs(cur_k1 - s_p1) < 0.02f) knob1_hooked = true;
@@ -646,7 +683,8 @@ void UpdateControls() {
     }
     if (knob2_hooked) effect_param2[current_effect] = cur_k2;
 
-    last_knob1_phys = cur_k1; last_knob2_phys = cur_k2;
+    last_knob1_phys = cur_k1; 
+    last_knob2_phys = cur_k2;
 
     // === OPTIMIZATION: Cache expensive parameter mappings (only computed on knob change) ===
     // PHASER parameter caching (replaces per-sample powf calculations)
@@ -658,9 +696,19 @@ void UpdateControls() {
         //phaser_rate_hz = 0.05f * exp2f(effect_param1[PHASER] * 7.64f);
         phaser_rate_hz = 0.05f + effect_param1[PHASER] * 10.0f;
         phaser_lfo_osc.SetFreq(phaser_rate_hz);
+        DefaultPhaserL.SetFreq(150.0f+effect_param1[PHASER]*2000.0f);
+        DefaultPhaserR.SetFreq(150.0f+effect_param1[PHASER]*2000.0f);
     }
     if (current_effect == PHASER && knob2_hooked) {
         // Feedback knob: cubic bipolar mapping
+        
+        DefaultPhaserL.SetFeedback(effect_param2[PHASER] );
+        DefaultPhaserL.SetLfoDepth(effect_param2[PHASER] );
+        DefaultPhaserR.SetFeedback(effect_param2[PHASER] );
+        DefaultPhaserR.SetLfoDepth(effect_param2[PHASER] );
+        DefaultPhaserL.SetLfoFreq(effect_param2[PHASER]*10.0f+0.5f);
+        DefaultPhaserR.SetLfoFreq(effect_param2[PHASER]*10.0f+0.5f);
+
         phaser_feedback_val = 7.9f * powf(effect_param2[PHASER] - 0.5f, 3.0f);
     }
 
@@ -669,6 +717,12 @@ void UpdateControls() {
         // LFO rate: 0.1 Hz to 4.0 Hz when in LFO zone (0-45%)
         wah_lfo_rate = 0.1f + ((effect_param1[WAH] / 0.45f) * 3.9f);
         wah_lfo_osc.SetFreq(wah_lfo_rate);
+    }
+
+///////////////////LEDS
+
+    if(UpdateErrorInterface()){
+        return;
     }
 
    // LED 1 Menu Color Indicators - Luminosité fixe à 0.7
@@ -713,7 +767,74 @@ void UpdateControls() {
 
 }
 
-void loop() {
+void loop() {    
     UpdateControls();
     delay(5); 
 }
+
+
+
+////////////////////////////////////// Error Management System State
+int active_error = 0;            // 0 = no error, 1 to 5 = active error code
+unsigned long error_timer = 0;   // Tracks the 1-second flash intervals
+int error_flash_count = 0;       // Tracks how many times it has flashed
+bool error_led_toggle = false;   // Controls the on/off state of the flash
+
+/**
+ * Triggers a visual error sequence.
+ * @param code The error ID (1 to 5)
+ */
+void TriggerError(int code) {
+    if (code >= 1 && code <= 5) {
+        active_error = code;
+        error_timer = millis();
+        error_flash_count = 0;
+        error_led_toggle = true; // Start in the ON phase
+    }
+}
+
+/**
+ * Non-blocking handler to update the error animation.
+ * Returns true if an error is actively handling the visual interface.
+ */
+bool UpdateErrorInterface() {
+    if (active_error == 0) {
+        return false; // No error active, allow normal LED behavior
+    }
+
+    unsigned long current_time = millis();
+
+    // 1000ms (1 second) interval for the on/off flash toggle
+    if (current_time - error_timer >= 1000) {
+        error_timer = current_time;
+        error_led_toggle = !error_led_toggle;
+
+        // Count a full flash cycle every time the LED transitions from ON to OFF
+        if (!error_led_toggle) {
+            error_flash_count++;
+            if (error_flash_count >= 5) {
+                active_error = 0; // Clear the error after 5 flashes
+                return false;
+            }
+        }
+    }
+
+    // Visual color assignment per error code when the toggle is ON
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    
+    if (error_led_toggle) {
+        switch (active_error) {
+            case 1: r = 1.0f; g = 0.0f; b = 0.0f; break; // Error 1: Pure Red
+            case 2: r = 0.0f; g = 1.0f; b = 0.0f; break; // Error 2: Pure Green
+            case 3: r = 0.0f; g = 0.0f; b = 1.0f; break; // Error 3: Pure Blue
+            case 4: r = 1.0f; g = 1.0f; b = 0.0f; break; // Error 4: Yellow
+            case 5: r = 1.0f; g = 0.0f; b = 1.0f; break; // Error 5: Magenta
+        }
+    }
+    // Force both LEDs to match the active error flash profile
+    pod.leds[0].Set(r, g, b);
+    pod.leds[1].Set(r, g, b);
+
+    return true; // Error mode is currently overriding the U
+}
+
