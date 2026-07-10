@@ -688,7 +688,7 @@ void UpdateControls() {
 
     // === OPTIMIZATION: Cache expensive parameter mappings (only computed on knob change) ===
     // PHASER parameter caching (replaces per-sample powf calculations)
-    if (current_effect == PHASER && knob1_hooked) {
+    if (current_effect == PHASER && effect_active[PHASER]) {
         // Rate knob: 0.05 Hz to 10.0 Hz exponential mapping 
         //float phaser_rate_hz = f_min * exp2f(val * log2f(f_max / f_min));
         //phaser_rate_hz = 0.05f * powf(200.0f, effect_param1[PHASER]);  // $0.05 \times 200^1 = 10.0 \text{ Hz}$
@@ -698,10 +698,8 @@ void UpdateControls() {
         phaser_lfo_osc.SetFreq(phaser_rate_hz);
         DefaultPhaserL.SetFreq(150.0f+effect_param1[PHASER]*2000.0f);
         DefaultPhaserR.SetFreq(150.0f+effect_param1[PHASER]*2000.0f);
-    }
-    if (current_effect == PHASER && knob2_hooked) {
-        // Feedback knob: cubic bipolar mapping
-        
+    
+    
         DefaultPhaserL.SetFeedback(effect_param2[PHASER] );
         DefaultPhaserL.SetLfoDepth(effect_param2[PHASER] );
         DefaultPhaserR.SetFeedback(effect_param2[PHASER] );
