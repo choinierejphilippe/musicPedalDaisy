@@ -329,7 +329,7 @@ float ProcessSpringReverb(float input, int ch, float size, float live_mix) {
 
 float ProcessPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
     return DefaultPhaser(input, ch, rate_hz, feedback_val, live_mix);
-   // return CustomJpsProcessPhaser(input, ch, rate_hz, feedback_val, live_mix);
+    //return CustomJpsProcessPhaser(input, ch, rate_hz, feedback_val, live_mix);
 }
 
 Phaser DefaultPhaserL;
@@ -346,66 +346,74 @@ float DefaultPhaser(float input, int ch, float rate_hz, float feedback_val, floa
 
 }
 
+inline float fast_pow2(float x) 
+{
+    // Clamp to prevent floating-point underflow/overflow bounds
+    if (x < -126.0f) return 0.0f;
+    if (x > 127.0f) return 3.4028234e38f; 
+
+    // Offset x by 127 (the IEEE-754 single-precision float exponent bias)
+    // Multiply by 2^23 to shift the value into the exponent bit fields
+    float clamped_and_biased = (x + 127.0f) * 8388608.0f;
+    
+    // Cast to a 32-bit integer to directly write into the raw memory bits
+    int32_t raw_bits = static_cast<int32_t>(clamped_and_biased);
+    
+    // Reinterpret those raw bits back into a valid float structure
+    float result;
+    std::memcpy(&result, &raw_bits, sizeof(float));
+    return result;
+}
+
 float CustomJpsProcessPhaser(float input, int ch, float rate_hz, float feedback_val, float live_mix) {
               
     // Constantes d'imperfection vintage (±4%)
     //const float imperfections[4] = {0.97f, 1.04f, 0.99f, 1.02f};
-const float imperfections[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    // LFO output from Daisy oscillator (efficient vs manual sinf)
-    float lfo_sine = (current_phaser_lfo_osc * 0.5f) + 0.5f;
+const float imperfections[4] = {1.02f, 1.01f, 0.995f, 0.998f};
 
     // --- 2. SWEEP RANGE (Logarithmique) ---
     // Plage: 150 Hz à 3000 Hz (3000 / 150 = 20.0)
    // float f_target = 150.0f * powf(20.0f, lfo_sine);
    // float f_target = 150.0f + (lfo_sine * 2200.0f); // Linéaire au lieu de powf (plus rapide)
-    float f_target = 150.0f + (lfo_sine * 2200.0f); // Linéaire au lieu de powf (plus rapide)
+    //float f_target = 700.0f * powf(2.0f,(current_phaser_lfo_osc*2.5f)); // center 700, 2.5 octaves
+    float f_target = 700.0f * fast_pow2(current_phaser_lfo_osc*2.5f); // center 700, 2.5 octaves
 
     // Clamp feedback to prevent runaway accumulation
     //float fb_safe = constrain(feedback_val, -0.85f, 0.85f);
 
     static float feedback_filter[2] = {0.0f, 0.0f};
+    feedback_val = 0.1;
     float fb_signal = last_output[ch] * feedback_val;
 
     // Passe-bas simple sur le feedback (évite l'instabilité dans les hautes)
     feedback_filter[ch] = (fb_signal * 0.2f) + (feedback_filter[ch] * 0.8f);
 
-    float current = input +  feedback_filter[ch];
+    float currentInput  = input +  feedback_filter[ch];
+    float stageInput = currentInput; 
     //current = SoftClip(current);
-
+    float w = tanf( PI * f_target / sample_rate_global);
     // --- 4. LES 4 ÉTAGES ALL-PASS ---
     for (int stage = 0; stage < 4; stage++) {
-        // Ajout de l'imperfection analogique, clamped
-        float f_stage = constrain(f_target * imperfections[stage], 100.0f, 3000.0f);
         
-        // Calcul du coefficient de filtre bilinéaire
-        //float omega = PI * f_stage / 48000.0f;
-        float w = tanf( PI * f_stage / sample_rate_global);
-        //float g = (1.0f - tanf(omega)) / (1.0f + tanf(omega));
-        //float g = (1.0f - omega) / (1.0f + omega);
-        // FIX 3: Coefficient all-pass stable (1er ordre)
-        // g = (1 - w/2) / (1 + w/2) est une approximation standard
-        float g = (1.0f - w) / (1.0f + w);
+        float g = (w-1.0f) / (w+1.0f) * imperfections[stage];
 
-        // Application du filtre passe-tout with normalization
-        //float ap_out = (g * current) + ap_state[ch][stage];
-        //ap_state[ch][stage] = current - (g * ap_out);
-        //current = ap_out;
+        
+        float previous = ap_state[ch][stage];
 
-        // All-pass stable (Formule de Schroeder)
-        float ap_in = current;
-        float ap_out = (g * ap_in) + ap_state[ch][stage];
-        ap_state[ch][stage] = ap_in - (g * ap_out);
-        current = ap_out;
+        float stageOutput = stageInput * g + previous;
+        ap_state[ch][stage] = stageInput - (g * stageOutput);
+        stageInput = stageOutput;
         //current = SoftClip(ap_out); // On avance l'étage suivant avec la sortie filtrée
     }
 
     // Mémorisation pour la boucle de feedback (with safety clipping)
-    last_output[ch] = current;
+    last_output[ch] = stageInput;
 
     // --- 5. MIXAGE PHASER & WET/DRY ---
     // Le son "Phaser" authentique est créé en additionnant le Dry et le signal déphasé (50/50).
     //float phaser_wet_signal = (input * 0.5f) + (current * 0.5f);
-    float phaser_wet_signal = (input - current) * 0.5f;
+    // add or substract, not clear.
+    float phaser_wet_signal = (input + stageInput) * 0.5f;
 
     // L'encodeur gère l'intensité globale via ApplyDryWet
     return ApplyDryWet(input, phaser_wet_signal, live_mix);
@@ -561,23 +569,18 @@ void setup() {
     phaser_lfo_osc.SetAmp(1.0f);
     
     DefaultPhaserL.Init(AUDIO_SR_48K);
-    DefaultPhaserL.SetFreq(1500.0f);
-    DefaultPhaserL.SetFeedback(0.7f);
+    DefaultPhaserL.SetFreq(750.0f);
+    DefaultPhaserL.SetFeedback(0.1f);
     DefaultPhaserL.SetLfoDepth(0.3f);    
-    DefaultPhaserL.SetLfoFreq(5.0f);
+    DefaultPhaserL.SetLfoFreq(2.0f);
     DefaultPhaserL.SetPoles(4);
 
     DefaultPhaserR.Init(AUDIO_SR_48K);
-    DefaultPhaserR.SetFreq(1500.0f);
-    DefaultPhaserR.SetFeedback(0.7f);
+    DefaultPhaserR.SetFreq(750.0f);
+    DefaultPhaserR.SetFeedback(0.1f);
     DefaultPhaserR.SetLfoDepth(0.3f);    
-    DefaultPhaserR.SetLfoFreq(5.0f);
+    DefaultPhaserR.SetLfoFreq(2.0f);
     DefaultPhaserR.SetPoles(4);
-    
-
-    // Exemple : Décalage de phase pour effet stéréo
-    //phaser_lfo_osc_left.SetPhase(0.0f);
-    //phaser_lfo_osc_right.SetPhase(0.25f); // Décalage de 90 degrés
     
     wah_lfo_osc.Init(AUDIO_SR_48K);
     wah_lfo_osc.SetWaveform(Oscillator::WAVE_SIN);
@@ -694,18 +697,19 @@ void UpdateControls() {
         //phaser_rate_hz = 0.05f * powf(200.0f, effect_param1[PHASER]);  // $0.05 \times 200^1 = 10.0 \text{ Hz}$
         //7.64 =  log2f(10.0f / 0.05)
         //phaser_rate_hz = 0.05f * exp2f(effect_param1[PHASER] * 7.64f);
-        phaser_rate_hz = 0.05f + effect_param1[PHASER] * 10.0f;
+        phaser_rate_hz = 0.05f + effect_param1[PHASER] * 2.0f;
         phaser_lfo_osc.SetFreq(phaser_rate_hz);
-        DefaultPhaserL.SetFreq(150.0f+effect_param1[PHASER]*2000.0f);
-        DefaultPhaserR.SetFreq(150.0f+effect_param1[PHASER]*2000.0f);
+        phaser_lfo_osc.SetAmp(effect_param2[PHASER]);
+        DefaultPhaserL.SetFreq(150.0f+effect_param1[PHASER]*1300.0f);
+        DefaultPhaserR.SetFreq(150.0f+effect_param1[PHASER]*1300.0f);
     
     
-        DefaultPhaserL.SetFeedback(effect_param2[PHASER] );
+        //DefaultPhaserL.SetFeedback(effect_param2[PHASER] );        
+        //DefaultPhaserR.SetFeedback(effect_param2[PHASER] );
         DefaultPhaserL.SetLfoDepth(effect_param2[PHASER] );
-        DefaultPhaserR.SetFeedback(effect_param2[PHASER] );
         DefaultPhaserR.SetLfoDepth(effect_param2[PHASER] );
-        DefaultPhaserL.SetLfoFreq(effect_param2[PHASER]*10.0f+0.5f);
-        DefaultPhaserR.SetLfoFreq(effect_param2[PHASER]*10.0f+0.5f);
+        DefaultPhaserL.SetLfoFreq(effect_param2[PHASER]*2.0f+0.5f);
+        DefaultPhaserR.SetLfoFreq(effect_param2[PHASER]*2.0f+0.5f);
 
         phaser_feedback_val = 7.9f * powf(effect_param2[PHASER] - 0.5f, 3.0f);
     }
